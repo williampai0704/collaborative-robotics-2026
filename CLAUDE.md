@@ -9,7 +9,7 @@
 
 ## Project Overview
 
-**TidyBot2** - A mobile robot platform with bimanual WX200 6-DOF arms for Stanford's Collaborative Robotics class. This repository provides MuJoCo simulation and ROS2 control software.
+**TidyBot2** - A mobile robot platform with bimanual WX200 5-DOF arms for Stanford's Collaborative Robotics class. This repository provides MuJoCo simulation and ROS2 control software.
 
 ### Robot Configuration
 - **Mobile Base:** 3 DOF (x, y, theta)

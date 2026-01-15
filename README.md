@@ -1,6 +1,6 @@
 # Collaborative Robotics 2026
 
-This repository contains software for controlling the **TidyBot2** mobile robot with bimanual **WX200** 6-DOF arms, developed for Professor Monroe Kennedy's 2026 Collaborative Robotics Class.
+This repository contains software for controlling the **TidyBot2** mobile robot with bimanual **WX200** 5-DOF arms, developed for Professor Monroe Kennedy's 2026 Collaborative Robotics Class.
 
 ## Installation
 
