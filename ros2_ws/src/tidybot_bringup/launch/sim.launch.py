@@ -54,6 +54,11 @@ def generate_launch_description():
         description='Use simulation time'
     )
 
+    declare_use_planner = DeclareLaunchArgument(
+        'use_motion_planner', default_value='true',
+        description='Launch motion planner for IK and trajectory planning'
+    )
+
     # URDF from xacro
     urdf_path = PathJoinSubstitution([pkg_description, 'urdf', 'tidybot_wx200.urdf.xacro'])
     robot_description = Command(['xacro ', urdf_path])
@@ -111,6 +116,25 @@ def generate_launch_description():
         }]
     )
 
+    # Motion planner (IK + collision checking)
+    # Uses the bimanual model (no scene objects) for IK solving
+    ik_model_path = os.path.join(repo_root, 'simulation', 'assets', 'mujoco', 'tidybot_wx200_bimanual.xml')
+    motion_planner = Node(
+        package='tidybot_ik',
+        executable='motion_planner_node',
+        name='motion_planner',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_motion_planner')),
+        parameters=[{
+            'model_path': ik_model_path,
+            'ik_dt': 0.002,
+            'ik_max_iterations': 500,
+            'position_tolerance': 0.01,
+            'orientation_tolerance': 0.1,
+            'min_collision_distance': 0.05,
+        }]
+    )
+
     # RViz
     rviz_config = PathJoinSubstitution([pkg_bringup, 'rviz', 'tidybot.rviz'])
     rviz = Node(
@@ -127,11 +151,13 @@ def generate_launch_description():
         declare_use_rviz,
         declare_show_viewer,
         declare_use_sim_time,
+        declare_use_planner,
 
         # Nodes
         robot_state_publisher,
         mujoco_bridge,
         right_arm_controller,
         left_arm_controller,
+        motion_planner,
         rviz,
     ])

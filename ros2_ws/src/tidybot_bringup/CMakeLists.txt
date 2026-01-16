@@ -24,7 +24,10 @@ install(PROGRAMS
   scripts/test_base.py
   scripts/test_camera.py
   scripts/test_arms.py
+  scripts/test_planner.py
   scripts/example_state_machine.py
+  scripts/trajectory_tracking.py
+  scripts/plot_trajectory.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PanTilt.msg"
   "srv/SolveIK.srv"
   "srv/GetJointState.srv"
+  "srv/PlanToTarget.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces
 )
 
