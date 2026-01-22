@@ -221,14 +221,22 @@ Managed via `uv` (see `pyproject.toml`):
 Build and run with VNC desktop access:
 
 ```bash
-# Build (from repo root)
+# 1. Clone the repo (if you haven't already)
+git clone https://github.com/Stanford-ARM-Lab/collaborative-robotics-2026.git
+cd collaborative-robotics-2026
+
+# 2. Build the Docker image
 docker build -f Docker/Dockerfile -t tidybot2:humble .
 
-# Run
-docker run -p 6080:80 --shm-size=2g tidybot2:humble
+# 3. Run with the repo mounted (changes sync between host and container)
+docker run -p 6080:80 --shm-size=2g \
+    -v $(pwd):/home/ubuntu/Desktop/collaborative \
+    tidybot2:humble
 
 # Access via browser: http://127.0.0.1:6080/
 ```
+
+**Syncing updates:** With the volume mount, any `git pull` on your host machine will immediately reflect inside the running container. This makes it easy to pull the latest changes without restarting the container.
 
 **Available commands in container:**
 | Command | Description |
