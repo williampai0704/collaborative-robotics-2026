@@ -16,14 +16,15 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Alex Qiu',
-    maintainer_email='aqiu34@stanford.edu',
+    maintainer='Alex Qiu and Joonwon Kang',
+    maintainer_email='aqiu34@stanford.edu, jwkang@stanford.edu',
     description='Control nodes for TidyBot2',
     license='MIT',
     entry_points={
         'console_scripts': [
             'arm_controller_node = tidybot_control.arm_controller_node:main',
-            'interbotix_arm_node = tidybot_control.interbotix_arm_node:main',
+            'arm_wrapper_node = tidybot_control.arm_wrapper_node:main',
+            # 'interbotix_arm_node = tidybot_control.interbotix_arm_node:main', # Deprecated, may be used in future to get rid of interbotix dependencies
             'phoenix6_base_node = tidybot_control.phoenix6_base_node:main',
             'pan_tilt_node = tidybot_control.pan_tilt_node:main',
             'dynamixel_bus_node = tidybot_control.dynamixel_bus_node:main',
