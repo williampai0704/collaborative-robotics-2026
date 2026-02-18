@@ -186,7 +186,7 @@ def main() -> None:
     SPIN_TIMEOUT_S = 0.02
     POSE_ERROR_TOL_RAD = 0.20
 
-    OUTPUT_PATH = "/home/sukeerth/Courses/ME326/Project/collaborative-robotics-2026/ros2_ws/src/vision/output"
+    OUTPUT_PATH = "/home/locobot/Team_3/collaborative-robotics-2026/ros2_ws/src/tidybot_bringup/scripts/vision/output/"
     PUTPUT_PATH = OUTPUT_PATH  # Kept as requested for quick manual edits
     # --------------------------------------------------------------------- #
 

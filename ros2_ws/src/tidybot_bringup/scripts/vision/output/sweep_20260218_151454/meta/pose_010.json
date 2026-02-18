@@ -1,0 +1,38 @@
+{
+  "pose_idx": 10,
+  "wall_time_s": 1771456513.1853049,
+  "command": {
+    "pan": -0.8,
+    "tilt": -0.09999999999999998
+  },
+  "state": {
+    "pan": -0.7685244083404541,
+    "tilt": -0.10124273598194122
+  },
+  "abs_error": {
+    "pan": 0.03147559165954594,
+    "tilt": 0.0012427359819412453
+  },
+  "settle_time_s": 1.5,
+  "rgb_frame": {
+    "stamp": {
+      "sec": 1771456513,
+      "nanosec": 49632324
+    },
+    "frame_id": "camera_color_optical_frame",
+    "encoding": "rgb8",
+    "width": 640,
+    "height": 480
+  },
+  "depth_frame": {
+    "stamp": {
+      "sec": 1771456513,
+      "nanosec": 116787598
+    },
+    "frame_id": "camera_depth_optical_frame",
+    "encoding": "16UC1",
+    "width": 640,
+    "height": 480
+  },
+  "success": true
+}

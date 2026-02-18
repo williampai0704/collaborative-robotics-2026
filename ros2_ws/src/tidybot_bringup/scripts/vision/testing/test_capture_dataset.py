@@ -227,7 +227,7 @@ def main() -> None:
     NUM_FRAMES = 30       # If > 0, stops when this many pairs are saved
     DURATION_S = 0.0      # If > 0 and NUM_FRAMES <= 0, capture for this duration
 
-    OUTPUT_PATH = "/home/sukeerth/Courses/ME326/Project/collaborative-robotics-2026/ros2_ws/src/vision/output"
+    OUTPUT_PATH = "/home/locobot/Team_3/collaborative-robotics-2026/ros2_ws/src/tidybot_bringup/scripts/vision/output/"
     PUTPUT_PATH = OUTPUT_PATH  # Kept as requested for quick manual edits
 
     SPIN_TIMEOUT_S = 0.02
