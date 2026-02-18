@@ -170,23 +170,17 @@ def save_pose_capture(
 
 def main() -> None:
     # ---------------------- Editable hyperparameters ---------------------- #
-    CENTER_PAN = 0.0
-    CENTER_TILT = 0.0
-    PAN_DELTA = 0.5
-    TILT_DELTA = 0.35
+    PAN_MIN = -0.8
+    PAN_MAX = 0.8
+    TILT_MIN = -0.5
+    TILT_MAX = 0.3
+    PAN_STEPS = 5
+    TILT_STEPS = 5
+    SERPENTINE_ORDER = True
 
-    # Pose sequence for sweep. Edit as needed.
-    SWEEP_POSES = [
-        (CENTER_PAN, CENTER_TILT),
-        (CENTER_PAN - PAN_DELTA, CENTER_TILT),
-        (CENTER_PAN, CENTER_TILT),
-        (CENTER_PAN + PAN_DELTA, CENTER_TILT),
-        (CENTER_PAN, CENTER_TILT),
-        (CENTER_PAN, CENTER_TILT - TILT_DELTA),
-        (CENTER_PAN, CENTER_TILT),
-        (CENTER_PAN, CENTER_TILT + TILT_DELTA),
-        (CENTER_PAN, CENTER_TILT),
-    ]
+    # Initial pose before sweep starts.
+    START_PAN = 0.0
+    START_TILT = 0.0
 
     SETTLE_TIME_S = 1.5
     SPIN_TIMEOUT_S = 0.02
@@ -198,6 +192,18 @@ def main() -> None:
 
     if not HAS_CV:
         raise RuntimeError("cv2/cv_bridge not available. Install OpenCV and ROS cv_bridge first.")
+    if PAN_STEPS < 1 or TILT_STEPS < 1:
+        raise ValueError("PAN_STEPS and TILT_STEPS must both be >= 1.")
+
+    pan_values = np.linspace(PAN_MIN, PAN_MAX, PAN_STEPS)
+    tilt_values = np.linspace(TILT_MIN, TILT_MAX, TILT_STEPS)
+    sweep_poses: list[tuple[float, float]] = []
+    for tilt_idx, tilt in enumerate(tilt_values):
+        row_pans = pan_values
+        if SERPENTINE_ORDER and (tilt_idx % 2 == 1):
+            row_pans = pan_values[::-1]
+        for pan in row_pans:
+            sweep_poses.append((float(pan), float(tilt)))
 
     rclpy.init()
     node = PanTiltSweepNode()
@@ -209,10 +215,10 @@ def main() -> None:
         # Warm-up a bit to receive first frames/state.
         warmup_end = time.time() + 2.0
         while rclpy.ok() and time.time() < warmup_end:
-            node.publish_pan_tilt(CENTER_PAN, CENTER_TILT)
+            node.publish_pan_tilt(START_PAN, START_TILT)
             rclpy.spin_once(node, timeout_sec=SPIN_TIMEOUT_S)
 
-        for i, (pan_cmd, tilt_cmd) in enumerate(SWEEP_POSES):
+        for i, (pan_cmd, tilt_cmd) in enumerate(sweep_poses):
             settle_end = time.time() + SETTLE_TIME_S
             while rclpy.ok() and time.time() < settle_end:
                 node.publish_pan_tilt(pan_cmd, tilt_cmd)
@@ -251,6 +257,8 @@ def main() -> None:
         print("\n===== Pan-Tilt Sweep Summary =====")
         print(f"Output dir: {out_dir}")
         print(f"Elapsed: {elapsed:.2f}s")
+        print(f"Grid: pan_steps={PAN_STEPS}, tilt_steps={TILT_STEPS}, expected_captures={len(sweep_poses)}")
+        print(f"Ranges: pan=[{PAN_MIN:.3f}, {PAN_MAX:.3f}], tilt=[{TILT_MIN:.3f}, {TILT_MAX:.3f}]")
         print(f"Poses attempted: {len(pose_results)}")
         print(f"Poses successful: {len(valid_results)}")
         print(f"Poses failed: {fail_count}")
