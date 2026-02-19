@@ -29,6 +29,7 @@ install(PROGRAMS
   scripts/test_base_real.py
   scripts/test_arms_real.py
   scripts/test_grippers_real.py
+  scripts/test_grasp_real.py
   scripts/test_pan_tilt_real.py
   scripts/test_torque_hold.py
   scripts/test_full_robot.py

@@ -31,12 +31,23 @@ import time
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
 from interbotix_xs_msgs.msg import JointSingleCommand
 
 
 # PWM pressure limits (from Interbotix SDK)
 GRIPPER_PRESSURE_LOWER = 150   # Minimum PWM for movement
 GRIPPER_PRESSURE_UPPER = 350   # Maximum PWM (avoid motor overload)
+
+# Finger position limits (meters, from MuJoCo bridge)
+FINGER_OPEN_POS = 0.037    # Fully open finger position
+FINGER_CLOSED_POS = 0.015  # Fully closed finger position
+
+# Finger joint names per side
+FINGER_JOINT_NAMES = {
+    'right': ['right_left_finger', 'right_right_finger'],
+    'left': ['left_left_finger', 'left_right_finger'],
+}
 
 
 class GripperController:
@@ -80,6 +91,12 @@ class GripperController:
             self.left_pub = node.create_publisher(
                 JointSingleCommand, '/left_arm/commands/joint_single', 10
             )
+
+        # Subscribe to /joint_states for grasp detection
+        self.finger_positions = {}
+        self.joint_state_sub = node.create_subscription(
+            JointState, '/joint_states', self._joint_state_callback, 10
+        )
 
         self.node.get_logger().debug(f'GripperController initialized (mode={mode})')
 
@@ -200,3 +217,76 @@ class GripperController:
             # Stop grippers
             self._publish_sdk('right', 0.0)
             self._publish_sdk('left', 0.0)
+
+    def _joint_state_callback(self, msg: JointState):
+        """Store latest finger joint positions from /joint_states."""
+        for i, name in enumerate(msg.name):
+            if 'finger' in name and i < len(msg.position):
+                self.finger_positions[name] = msg.position[i]
+
+    def check_grasp(self, side: str, threshold: float = 0.003) -> bool:
+        """
+        Check if the gripper successfully grasped an object.
+
+        Compares actual finger position against the fully-closed position.
+        If the fingers stopped short of fully closed (blocked by an object),
+        the grasp is considered successful.
+
+        Call this after close() or set_position() with position=1.0.
+
+        Args:
+            side: 'right' or 'left'
+            threshold: Minimum distance (meters) above closed position to
+                       count as a successful grasp. Default 0.003m (3mm).
+
+        Returns:
+            True if an object is detected between the fingers, False otherwise.
+        """
+        finger_names = FINGER_JOINT_NAMES.get(side)
+        if finger_names is None:
+            self.node.get_logger().warn(f"Invalid side '{side}' for check_grasp")
+            return False
+
+        # Spin briefly to ensure we have fresh joint state data
+        for _ in range(10):
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+        # Read actual finger positions
+        positions = []
+        for fname in finger_names:
+            pos = self.finger_positions.get(fname)
+            if pos is None:
+                self.node.get_logger().warn(
+                    f"No joint state for '{fname}' — is /joint_states being published?"
+                )
+                return False
+            positions.append(pos)
+
+        # Average of both finger positions
+        avg_pos = sum(positions) / len(positions)
+
+        # If fingers stopped above (closed + threshold), something is between them
+        grasped = avg_pos > (FINGER_CLOSED_POS + threshold)
+
+        self.node.get_logger().info(
+            f'Grasp check ({side}): finger_pos={avg_pos:.4f}m, '
+            f'closed={FINGER_CLOSED_POS}m, threshold={threshold}m, '
+            f'grasped={grasped}'
+        )
+        return grasped
+
+    def close_and_check(self, side: str, duration: float = 2.0,
+                        threshold: float = 0.003) -> bool:
+        """
+        Close the gripper and check if an object was grasped.
+
+        Args:
+            side: 'right' or 'left'
+            duration: Time to publish close command (seconds).
+            threshold: Grasp detection threshold in meters.
+
+        Returns:
+            True if an object is detected between the fingers, False otherwise.
+        """
+        self.close(side, duration)
+        return self.check_grasp(side, threshold)
