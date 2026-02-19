@@ -13,6 +13,12 @@ Usage:
     ros2 topic pub /stop_move std_msgs/msg/Bool "{data: true}" --once
 """
 
+# COMMAND IN TERMINAL TO START MOVING FORWARD:
+# ros2 run tidybot_bringup linear-test-1.py --ros-args -p linear_speed:=0.02 -p timeout:=1.0
+
+# COMMAND IN TERMINAL TO STOP ROBOT:
+# ros2 topic pub /stop_move std_msgs/msg/Bool "{data: true}" --once
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -21,13 +27,16 @@ from std_msgs.msg import Bool
 import numpy as np
 import time
 
+robot_speed = 0.02
+robot_motion_timeout_duration = 1.0  # seconds
 
 class MoveStraight(Node):
     def __init__(self):
         super().__init__('move_straight')
 
         # Declare parameters
-        self.declare_parameter('linear_speed', 0.2)  # m/s (positive = forward)
+        self.declare_parameter('linear_speed', robot_speed)  # m/s (positive = forward)
+        self.declare_parameter('timeout', robot_motion_timeout_duration)  # seconds
         
         # State variables
         self.should_stop = False
@@ -61,7 +70,7 @@ class MoveStraight(Node):
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
         
-        # Get orientation and correct for frame offset
+        # Get orientation and correct for frame offset  
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         
@@ -95,17 +104,20 @@ class MoveStraight(Node):
     def run_straight(self):
         """Main control loop for straight line movement."""
         # Wait for connection
-        timeout = 5.0
+        odom_timeout = 5.0 # if no odometry in 5 seconds give an error.
         start = time.time()
-        while not self.odom_received and (time.time() - start) < timeout:
-            rclpy.spin_once(self, timeout_sec=0.1)
+
+        while not self.odom_received and (time.time() - start) < odom_timeout:
+            rclpy.spin_once(self, timeout_sec=0.1) # timeout sec is the time ros2 takes to wait for a command
 
         if not self.odom_received:
-            self.get_logger().error('No odometry received! Is the base node running?')
+            self.get_logger().error('No odometry received! Make sure the base node is running?')
             return False
 
         linear_speed = self.get_parameter('linear_speed').value
         
+        robot_motion_timeout = self.get_parameter('timeout').value
+
         direction = "forward" if linear_speed >= 0 else "backward"
         
         self.get_logger().info('')
@@ -124,6 +136,11 @@ class MoveStraight(Node):
 
         rate = self.create_rate(20)  # 20 Hz
         while rclpy.ok() and not self.should_stop:
+            elapsed = time.time() - start_time
+            if elapsed >= robot_motion_timeout:
+                self.get_logger().info('Timeout reached! Stopping robot.')
+                break
+
             self.cmd_vel_pub.publish(vel)
             rclpy.spin_once(self, timeout_sec=0.01)
             
