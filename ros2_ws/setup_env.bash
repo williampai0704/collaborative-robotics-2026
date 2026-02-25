@@ -15,7 +15,20 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 echo "Setting up TidyBot2 ROS2 environment..."
 echo ""
 
-# 0. Deactivate any active venv and remove .venv from PATH
+# 0. Check for conda - it's incompatible with ROS2
+if [ -n "$CONDA_PREFIX" ]; then
+    echo "✗ ERROR: Conda is active (Python: $(which python3))"
+    echo ""
+    echo "  ROS2 Humble requires system Python 3.10, but conda provides a different Python."
+    echo "  Please deactivate conda first:"
+    echo ""
+    echo "    conda deactivate"
+    echo "    source setup_env.bash"
+    echo ""
+    return 1
+fi
+
+# 0.5. Deactivate any active venv and remove .venv from PATH
 #    This ensures colcon uses system Python, not venv Python
 if [ -n "$VIRTUAL_ENV" ]; then
     deactivate 2>/dev/null
@@ -87,7 +100,7 @@ else
 fi
 
 export ROS_DOMAIN_ID=42 # domain id for the robot
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp # DDS implementation
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp # DDS implementation (Fast DDS is default in Humble)
 echo "✓ Set ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
 echo "✓ Set RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION"
 

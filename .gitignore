@@ -58,3 +58,10 @@ ros2_ws/log/
 
 # Audio recordings from microphone tests
 **/recordings/
+
+# Credentials and API keys - NEVER commit these
+**/credentials/*.json
+**/credentials/*.key
+*.credentials
+.env
+.env.*

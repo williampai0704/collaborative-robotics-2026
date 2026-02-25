@@ -32,6 +32,10 @@ dependencies = [
     "threadpoolctl>=3.6.0",
     "transforms3d>=0.4.1",
     "modern-robotics>=1.1.0",
+    # Speech and AI
+    "google-generativeai>=0.8.0",
+    "google-cloud-speech>=2.27.0",
+    "pydub>=0.25.1",
 ]
 
 # =============================================================================
