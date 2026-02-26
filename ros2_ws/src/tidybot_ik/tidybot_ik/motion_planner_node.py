@@ -72,7 +72,7 @@ class MotionPlannerNode(Node):
         self.position_tolerance = self.get_parameter('position_tolerance').get_parameter_value().double_value
         self.orientation_tolerance = self.get_parameter('orientation_tolerance').get_parameter_value().double_value
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
-
+        sim_path = ""
         # Find model path
         if model_path_param:
             model_path = Path(model_path_param)
