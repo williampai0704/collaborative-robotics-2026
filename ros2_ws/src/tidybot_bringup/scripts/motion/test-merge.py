@@ -2,6 +2,9 @@
 """
 Control TidyBot to move in a straight line or spin in place based on commands.
 
+Setup:
+ros2 run tidybot_bringup test-merge.py --ros-args -p linear_speed:=# -p angular_speed:=# -p timeout:=#
+
 Topics:
 - Publishes:  /cmd_vel (geometry_msgs/Twist)
 - Subscribes: /odom (nav_msgs/Odometry)
