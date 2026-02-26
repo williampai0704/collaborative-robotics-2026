@@ -68,6 +68,7 @@ class MotionController(Node):
 
     def odom_callback(self, msg):
         """Extract position and orientation from odometry."""
+
         # Get position
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y

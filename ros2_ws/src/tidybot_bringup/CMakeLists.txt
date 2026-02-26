@@ -37,6 +37,9 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  scripts/motion/test-linear.py
+  scripts/motion/test-spinning.py
+  scripts/motion/test-merge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
