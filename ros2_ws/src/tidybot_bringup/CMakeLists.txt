@@ -37,6 +37,8 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  # Vision scripts
+  scripts/vision/icp_pose_node.py
   scripts/vision/testing/test_camera_smoke.py
   scripts/vision/testing/test_capture_dataset.py
   scripts/vision/testing/test_pan_tilt_sweep.py
