@@ -5,6 +5,12 @@ ICP-based Object Pose Estimation Node
 A simpler alternative to FoundationPose that uses ICP (Iterative Closest Point)
 for 6-DOF pose estimation from RGB-D images and object masks.
 
+Supports two mask sources:
+1. Color-based mask (default) - uses HSV thresholding
+2. SAM3 mask (optional) - from external segmentation
+
+Debug mode loads images from test_data folder instead of ROS topics.
+
 Pipeline:
 1. Receive RGB image, depth image, object mask, and camera intrinsics
 2. Back-project masked depth pixels to 3D point cloud (scene cloud)
@@ -14,10 +20,10 @@ Pipeline:
 
 Topics:
 - Subscribes to:
-  - /camera/color/image_raw (sensor_msgs/Image) - RGB image (for visualization)
+  - /camera/color/image_raw (sensor_msgs/Image) - RGB image
   - /camera/depth/image_raw (sensor_msgs/Image) - Depth image
   - /camera/color/camera_info (sensor_msgs/CameraInfo) - Camera intrinsics
-  - /object_mask (sensor_msgs/Image) - Object segmentation mask
+  - /object_mask (sensor_msgs/Image) - Object segmentation mask (if use_sam3_mask=true)
 
 - Publishes to:
   - /object_pose (geometry_msgs/PoseStamped) - Estimated 6-DOF pose in camera frame
@@ -28,6 +34,10 @@ Topics:
 
 Parameters:
 - mesh_file: Path to object mesh (.obj, .stl, .ply)
+- debug: Enable debug mode (load from test_data)
+- debug_pair: Which pair to load (0-5)
+- target_color: Color for mask (r, g, b, y)
+- use_sam3_mask: Use SAM3 mask instead of color mask
 - num_mesh_samples: Number of points to sample from mesh (default: 5000)
 - icp_max_iterations: Max ICP iterations (default: 50)
 - icp_threshold: ICP convergence threshold (default: 1e-6)
@@ -37,8 +47,14 @@ Parameters:
 - base_frame: Robot base frame name (default: base_link)
 
 Usage:
+    # Normal mode
     ros2 run tidybot_bringup icp_pose_node.py --ros-args \
         -p mesh_file:=/path/to/object.obj
+
+    # Debug mode (from test_data)
+    ros2 run tidybot_bringup icp_pose_node.py --ros-args \
+        -p mesh_file:=/path/to/object.obj \
+        -p debug:=true -p debug_pair:=0 -p target_color:=r
 """
 
 import os
@@ -62,6 +78,14 @@ import struct
 # TF2 for frame transformations
 from tf2_ros import Buffer, TransformListener, TransformException
 
+# Add script directory to path for imports
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from color_mask import color_mask
+from visualize_pc import depth_to_pointcloud, load_camera_intrinsics, DEFAULT_DEPTH_FX, DEFAULT_DEPTH_FY, DEFAULT_DEPTH_CX, DEFAULT_DEPTH_CY
+
 # Optional imports for point cloud processing
 try:
     import open3d as o3d
@@ -74,6 +98,9 @@ try:
     TRIMESH_AVAILABLE = True
 except ImportError:
     TRIMESH_AVAILABLE = False
+
+# Test data path for debug mode
+TEST_DATA_PATH = '/home/cdc/collaborative-robotics-2026/test_data'
 
 
 class ICPPoseNode(Node):
@@ -92,6 +119,10 @@ class ICPPoseNode(Node):
 
         # Declare parameters
         self.declare_parameter('mesh_file', '')
+        self.declare_parameter('debug', False)
+        self.declare_parameter('debug_pair', 0)
+        self.declare_parameter('target_color', 'r')
+        self.declare_parameter('use_sam3_mask', False)
         self.declare_parameter('num_mesh_samples', 5000)
         self.declare_parameter('icp_max_iterations', 50)
         self.declare_parameter('icp_threshold', 1e-6)
@@ -104,6 +135,10 @@ class ICPPoseNode(Node):
 
         # Get parameters
         mesh_file = self.get_parameter('mesh_file').get_parameter_value().string_value
+        self.debug = self.get_parameter('debug').get_parameter_value().bool_value
+        self.debug_pair = self.get_parameter('debug_pair').get_parameter_value().integer_value
+        self.target_color = self.get_parameter('target_color').get_parameter_value().string_value
+        self.use_sam3_mask = self.get_parameter('use_sam3_mask').get_parameter_value().bool_value
         self.num_mesh_samples = self.get_parameter('num_mesh_samples').get_parameter_value().integer_value
         self.icp_max_iterations = self.get_parameter('icp_max_iterations').get_parameter_value().integer_value
         self.icp_threshold = self.get_parameter('icp_threshold').get_parameter_value().double_value
@@ -138,28 +173,12 @@ class ICPPoseNode(Node):
         self.rgb_image = None
         self.depth_image = None
         self.camera_info = None
-        self.object_mask = None
+        self.object_mask = None  # For SAM3 mask mode
         self.K = None  # Camera intrinsic matrix
-        self.new_mask_received = False
+        self.new_data_received = False
 
         # Last estimated pose (for tracking/smoothing)
         self.last_pose = None
-
-        # QoS for image topics
-        image_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            depth=1
-        )
-
-        # Subscribers
-        self.rgb_sub = self.create_subscription(
-            Image, '/camera/color/image_raw', self.rgb_callback, image_qos)
-        self.depth_sub = self.create_subscription(
-            Image, '/camera/depth/image_raw', self.depth_callback, image_qos)
-        self.camera_info_sub = self.create_subscription(
-            CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
-        self.mask_sub = self.create_subscription(
-            Image, '/object_mask', self.mask_callback, 10)
 
         # Publishers
         self.pose_pub = self.create_publisher(PoseStamped, '/object_pose', 10)
@@ -172,8 +191,40 @@ class ICPPoseNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Timer for pose estimation (10 Hz)
-        self.timer = self.create_timer(0.1, self.estimate_pose_callback)
+        if self.debug:
+            # Debug mode: load from test_data
+            self.get_logger().info(f'DEBUG MODE: Loading from test_data/pair_{self.debug_pair:04d}')
+            self.get_logger().info(f'Target color: {self.target_color}')
+            # Set default camera intrinsics for debug mode (typical RealSense D435)
+            self.K = np.array([
+                [615.0, 0.0, 320.0],
+                [0.0, 615.0, 240.0],
+                [0.0, 0.0, 1.0]
+            ])
+            self.timer = self.create_timer(1.0, self.debug_process)
+        else:
+            # Normal mode: subscribe to topics
+            image_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                depth=1
+            )
+
+            self.rgb_sub = self.create_subscription(
+                Image, '/camera/color/image_raw', self.rgb_callback, image_qos)
+            self.depth_sub = self.create_subscription(
+                Image, '/camera/depth/image_raw', self.depth_callback, image_qos)
+            self.camera_info_sub = self.create_subscription(
+                CameraInfo, '/camera/color/camera_info', self.camera_info_callback, 10)
+
+            if self.use_sam3_mask:
+                self.get_logger().info('Using SAM3 mask from /object_mask')
+                self.mask_sub = self.create_subscription(
+                    Image, '/object_mask', self.mask_callback, 10)
+            else:
+                self.get_logger().info(f'Using color mask (target: {self.target_color})')
+
+            # Timer for pose estimation (10 Hz)
+            self.timer = self.create_timer(0.1, self.estimate_pose_callback)
 
         self.get_logger().info('=' * 50)
         self.get_logger().info('ICP Pose Estimation Node Initialized')
@@ -181,13 +232,246 @@ class ICPPoseNode(Node):
         self.get_logger().info(f'  Model points: {len(self.model_cloud.points)}')
         self.get_logger().info(f'  Voxel size: {self.voxel_size}m')
         self.get_logger().info(f'  ICP iterations: {self.icp_max_iterations}')
-        self.get_logger().info(f'  Camera frame: {self.camera_frame}')
-        self.get_logger().info(f'  Base frame: {self.base_frame}')
-        self.get_logger().info('  Publishing:')
-        self.get_logger().info('    /object_pose (camera frame)')
-        self.get_logger().info('    /object_pose_base (robot base frame)')
-        self.get_logger().info('  Waiting for images and object mask...')
+        self.get_logger().info(f'  Debug mode: {self.debug}')
+        self.get_logger().info(f'  Mask mode: {"SAM3" if self.use_sam3_mask else f"color ({self.target_color})"}')
         self.get_logger().info('=' * 50)
+
+    def debug_process(self):
+        """Process test data in debug mode with visualization."""
+        self.timer.cancel()
+
+        pair_dir = os.path.join(TEST_DATA_PATH, f'pair_{self.debug_pair:04d}')
+        rgb_path = os.path.join(pair_dir, 'rgb.png')
+        depth_path = os.path.join(pair_dir, 'depth.png')
+        depth_npy_path = os.path.join(pair_dir, 'depth.npy')
+        meta_path = os.path.join(pair_dir, 'meta.mat')
+
+        if not os.path.exists(rgb_path):
+            self.get_logger().error(f'RGB image not found: {rgb_path}')
+            return
+
+        # Load RGB image
+        rgb_bgr = cv2.imread(rgb_path)
+        rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+        self.get_logger().info(f'Loaded RGB image: {rgb.shape}')
+
+        # Load depth (prefer .npy if available)
+        if os.path.exists(depth_npy_path):
+            depth_raw = np.load(depth_npy_path)
+            self.get_logger().info(f'Loaded depth from npy: {depth_raw.shape}, dtype: {depth_raw.dtype}')
+        elif os.path.exists(depth_path):
+            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            self.get_logger().info(f'Loaded depth from png: {depth_raw.shape}, dtype: {depth_raw.dtype}')
+        else:
+            self.get_logger().error(f'Depth image not found in {pair_dir}')
+            return
+
+        # Convert depth to meters
+        if depth_raw.dtype == np.uint16:
+            depth = depth_raw.astype(np.float32) / self.depth_scale
+        elif depth_raw.max() > 100:  # Likely in mm
+            depth = depth_raw.astype(np.float32) / self.depth_scale
+        else:
+            depth = depth_raw.astype(np.float32)
+
+        # Load camera intrinsics
+        rgb_fx, rgb_fy, rgb_cx, rgb_cy = load_camera_intrinsics(meta_path)
+        self.K = np.array([
+            [rgb_fx, 0.0, rgb_cx],
+            [0.0, rgb_fy, rgb_cy],
+            [0.0, 0.0, 1.0]
+        ])
+
+        # Generate color mask
+        mask = color_mask(rgb, self.target_color)
+        self.get_logger().info(f'Generated color mask, non-zero pixels: {np.count_nonzero(mask)}')
+
+        # Run pose estimation and get results
+        result = self.run_pose_estimation(rgb, depth, mask, return_result=True)
+
+        # Visualize results
+        self.visualize_debug(rgb_bgr, depth_raw, mask, rgb, result)
+
+    def visualize_debug(self, rgb_bgr, depth_raw, mask, rgb, result):
+        """Visualize debug results with OpenCV and Open3D.
+        
+        Args:
+            rgb_bgr: Original RGB image in BGR format
+            depth_raw: Raw depth image (for visualization)
+            mask: Binary mask
+            rgb: RGB image (for point cloud)
+            result: Dictionary with pose estimation results or None
+        """
+        h, w = mask.shape[:2]
+        
+        # === 2D Visualization with OpenCV ===
+        
+        # 1. Depth colormap
+        depth_vis = depth_raw.astype(np.float32)
+        depth_vis[depth_vis == 0] = np.nan
+        vmin = np.nanpercentile(depth_vis, 5) if np.any(~np.isnan(depth_vis)) else 0
+        vmax = np.nanpercentile(depth_vis, 95) if np.any(~np.isnan(depth_vis)) else 1
+        depth_normalized = np.clip((depth_raw.astype(np.float32) - vmin) / (vmax - vmin + 1e-6), 0, 1)
+        depth_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        depth_colored[depth_raw == 0] = 0
+        
+        # 2. Mask visualization
+        color_tints = {
+            'red': (0, 0, 255), 'r': (0, 0, 255),
+            'green': (0, 255, 0), 'g': (0, 255, 0),
+            'blue': (255, 0, 0), 'b': (255, 0, 0),
+            'yellow': (0, 255, 255), 'y': (0, 255, 255)
+        }
+        tint = color_tints.get(self.target_color.lower(), (255, 255, 255))
+        mask_colored = np.zeros_like(rgb_bgr)
+        mask_colored[mask > 0] = tint
+        
+        # 3. Overlay with pose visualization
+        overlay = rgb_bgr.copy()
+        overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+        
+        # Draw mask contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, tint, 2)
+        
+        # Add pose info if available
+        if result and result.get('transform') is not None:
+            transform = result['transform']
+            pos = transform[:3, 3]
+            fitness = result.get('fitness', 0)
+            rmse = result.get('rmse', 0)
+            
+            # Draw projected bounding box
+            self._draw_bbox_on_image(overlay, transform, self.K)
+            
+            # Add text info
+            info_text = [
+                f'Position: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m',
+                f'Fitness: {fitness:.4f}',
+                f'RMSE: {rmse:.6f}',
+            ]
+            for i, text in enumerate(info_text):
+                cv2.putText(overlay, text, (10, 25 + i * 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(overlay, text, (10, 25 + i * 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        else:
+            cv2.putText(overlay, 'Pose estimation failed', (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
+        # 4. Info panel
+        info_panel = np.zeros_like(rgb_bgr)
+        info_lines = [
+            f'Target Color: {self.target_color}',
+            f'Image Size: {w} x {h}',
+            f'Mask Pixels: {np.count_nonzero(mask)}',
+            f'Mesh: {os.path.basename(self.get_parameter("mesh_file").get_parameter_value().string_value)}',
+        ]
+        if result:
+            info_lines.extend([
+                f'Scene Points: {result.get("scene_points", 0)}',
+                f'Model Points: {len(self.model_cloud.points)}',
+            ])
+        for i, line in enumerate(info_lines):
+            cv2.putText(info_panel, line, (10, 25 + i * 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        
+        # 5. Create combined 2D visualization (2x2 grid)
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        row1 = np.hstack([rgb_bgr, depth_colored])
+        row2 = np.hstack([overlay, mask_bgr])
+        combined = np.vstack([row1, row2])
+        
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(combined, 'RGB', (10, 20), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, 'Depth', (w + 10, 20), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, 'Pose Overlay', (10, h + 20), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, 'Mask', (w + 10, h + 20), font, 0.6, (255, 255, 255), 1)
+        
+        cv2.imshow('ICP Pose Debug - 2D', combined)
+        
+        # === 3D Visualization with Open3D ===
+        if result and result.get('scene_cloud') is not None:
+            self.get_logger().info('Opening 3D visualization...')
+            self.get_logger().info('Controls: Left-drag=Rotate, Right-drag=Pan, Scroll=Zoom, Q=Quit')
+            
+            geometries = []
+            
+            # Scene point cloud (colored)
+            scene_cloud = result['scene_cloud']
+            geometries.append(scene_cloud)
+            
+            # Model point cloud (transformed, painted red for visibility)
+            if result.get('transform') is not None:
+                model_transformed = o3d.geometry.PointCloud(self.model_cloud)
+                model_transformed.transform(result['transform'])
+                model_transformed.paint_uniform_color([1.0, 0.0, 0.0])  # Red
+                geometries.append(model_transformed)
+            
+            # Coordinate frame at estimated pose
+            if result.get('transform') is not None:
+                coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                    size=0.05, origin=[0, 0, 0])
+                coord_frame.transform(result['transform'])
+                geometries.append(coord_frame)
+            
+            # Origin coordinate frame
+            origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=0.1, origin=[0, 0, 0])
+            geometries.append(origin_frame)
+            
+            # Show 3D visualization
+            o3d.visualization.draw_geometries(
+                geometries,
+                window_name='ICP Pose Debug - 3D Point Clouds',
+                width=1280,
+                height=720
+            )
+        
+        self.get_logger().info('Press any key on 2D window to close...')
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    def _draw_bbox_on_image(self, image, transform, K):
+        """Draw projected 3D bounding box on image."""
+        try:
+            corners_3d = self._get_bbox_corners()
+            corners_transformed = (transform[:3, :3] @ corners_3d.T + transform[:3, 3:4]).T
+            
+            # Project to 2D
+            corners_2d = (K @ corners_transformed.T).T
+            corners_2d = corners_2d[:, :2] / corners_2d[:, 2:3]
+            corners_2d = corners_2d.astype(int)
+            
+            # Draw edges
+            edges = [
+                (0, 1), (1, 3), (3, 2), (2, 0),  # Bottom face
+                (4, 5), (5, 7), (7, 6), (6, 4),  # Top face
+                (0, 4), (1, 5), (2, 6), (3, 7)   # Vertical edges
+            ]
+            for i, j in edges:
+                pt1 = tuple(corners_2d[i])
+                pt2 = tuple(corners_2d[j])
+                cv2.line(image, pt1, pt2, (0, 255, 0), 2)
+            
+            # Draw coordinate axes at object origin
+            origin = transform[:3, 3]
+            axis_length = 0.05
+            axes = np.eye(3) * axis_length
+            axes_transformed = (transform[:3, :3] @ axes.T).T + origin
+            
+            origin_2d = (K @ origin)
+            origin_2d = (int(origin_2d[0] / origin_2d[2]), int(origin_2d[1] / origin_2d[2]))
+            
+            colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR for XYZ
+            for i, color in enumerate(colors):
+                end = axes_transformed[i]
+                end_2d = (K @ end)
+                end_2d = (int(end_2d[0] / end_2d[2]), int(end_2d[1] / end_2d[2]))
+                cv2.arrowedLine(image, origin_2d, end_2d, color, 2, tipLength=0.2)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to draw bbox: {e}')
 
     def _load_mesh_as_pointcloud(self, mesh_file: str) -> o3d.geometry.PointCloud:
         """Load mesh and sample points to create model point cloud."""
@@ -234,6 +518,7 @@ class ICPPoseNode(Node):
         try:
             with self.lock:
                 self.rgb_image = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
+                self.new_data_received = True
         except Exception as e:
             self.get_logger().warn(f'Failed to convert RGB image: {e}')
 
@@ -247,6 +532,7 @@ class ICPPoseNode(Node):
                     self.depth_image = depth.astype(np.float32) / self.depth_scale
                 else:
                     self.depth_image = depth.astype(np.float32)
+                self.new_data_received = True
         except Exception as e:
             self.get_logger().warn(f'Failed to convert depth image: {e}')
 
@@ -257,15 +543,117 @@ class ICPPoseNode(Node):
             self.K = np.array(msg.k).reshape(3, 3)
 
     def mask_callback(self, msg: Image):
-        """Handle object segmentation mask."""
+        """Handle SAM3 object segmentation mask (kept for future use)."""
         try:
             with self.lock:
                 mask = self.bridge.imgmsg_to_cv2(msg, 'mono8')
-                self.object_mask = (mask > 127).astype(np.uint8)
-                self.new_mask_received = True
-                self.get_logger().info('New object mask received')
+                self.object_mask = (mask > 127).astype(np.uint8) * 255
+                self.new_data_received = True
+                self.get_logger().info('New SAM3 mask received')
         except Exception as e:
             self.get_logger().warn(f'Failed to convert mask: {e}')
+
+    def estimate_pose_callback(self):
+        """Timer callback to run pose estimation."""
+        with self.lock:
+            rgb = self.rgb_image
+            depth = self.depth_image
+            K = self.K
+            sam3_mask = self.object_mask
+            new_data = self.new_data_received
+            self.new_data_received = False
+
+        # Check if we have required data
+        if depth is None or K is None or rgb is None:
+            return
+
+        if not new_data:
+            return
+
+        # Generate mask
+        if self.use_sam3_mask:
+            if sam3_mask is None:
+                return
+            mask = sam3_mask
+        else:
+            mask = color_mask(rgb, self.target_color)
+
+        self.run_pose_estimation(rgb, depth, mask)
+
+    def run_pose_estimation(self, rgb, depth, mask, return_result=False):
+        """Run the full pose estimation pipeline.
+        
+        Args:
+            rgb: RGB image
+            depth: Depth image in meters
+            mask: Binary mask
+            return_result: If True, return dict with results for visualization
+            
+        Returns:
+            If return_result: dict with 'transform', 'fitness', 'rmse', 'scene_cloud', 'scene_points'
+            Otherwise: None
+        """
+        result = {
+            'transform': None,
+            'fitness': 0,
+            'rmse': 0,
+            'scene_cloud': None,
+            'scene_points': 0,
+        }
+        
+        try:
+            # Step 1: Back-project masked depth to 3D point cloud
+            self.get_logger().info('Back-projecting depth to point cloud...')
+            scene_cloud = self.backproject_to_pointcloud(depth, mask, self.K, rgb)
+
+            if scene_cloud is None:
+                if return_result:
+                    return result
+                return
+
+            self.get_logger().info(f'Scene cloud: {len(scene_cloud.points)} points')
+            result['scene_points'] = len(scene_cloud.points)
+
+            # Downsample scene cloud
+            scene_cloud_down = scene_cloud.voxel_down_sample(self.voxel_size)
+            self.get_logger().info(f'Downsampled scene cloud: {len(scene_cloud_down.points)} points')
+            result['scene_cloud'] = scene_cloud_down
+
+            # Step 2: Initial alignment (centroid + PCA)
+            self.get_logger().info('Computing initial alignment...')
+            initial_transform = self.compute_initial_alignment(self.model_cloud, scene_cloud_down)
+
+            # Step 3: ICP refinement
+            self.get_logger().info('Running ICP refinement...')
+            final_transform, fitness, rmse = self.run_icp(
+                self.model_cloud, scene_cloud_down, initial_transform)
+
+            self.get_logger().info(f'ICP result: fitness={fitness:.4f}, RMSE={rmse:.6f}')
+            
+            result['transform'] = final_transform
+            result['fitness'] = fitness
+            result['rmse'] = rmse
+
+            # Store last pose
+            self.last_pose = final_transform
+
+            # Publish pose
+            self._publish_pose(final_transform)
+
+            # Publish debug visualization
+            if rgb is not None:
+                self._publish_debug_image(rgb, final_transform, self.K, mask)
+
+            # Publish point clouds for RViz
+            self._publish_pointclouds(scene_cloud_down, final_transform)
+
+        except Exception as e:
+            self.get_logger().error(f'Pose estimation failed: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+        
+        if return_result:
+            return result
 
     def backproject_to_pointcloud(self, depth: np.ndarray, mask: np.ndarray,
                                    K: np.ndarray, rgb: np.ndarray = None) -> o3d.geometry.PointCloud:
@@ -281,7 +669,7 @@ class ICPPoseNode(Node):
         Returns:
             Open3D PointCloud in camera frame
         """
-        H, W = depth.shape
+        H, W = depth.shape[:2]
 
         # Get valid pixels (masked and valid depth)
         valid = (mask > 0) & (depth > 0.001) & (depth < 10.0)  # 1mm to 10m
@@ -407,67 +795,6 @@ class ICPPoseNode(Node):
 
         return result.transformation, result.fitness, result.inlier_rmse
 
-    def estimate_pose_callback(self):
-        """Timer callback to run pose estimation."""
-        with self.lock:
-            rgb = self.rgb_image
-            depth = self.depth_image
-            K = self.K
-            mask = self.object_mask
-            new_mask = self.new_mask_received
-            self.new_mask_received = False
-
-        # Check if we have all required data
-        if depth is None or K is None or mask is None:
-            return
-
-        # Only run when we have a new mask
-        if not new_mask:
-            return
-
-        try:
-            # Step 1: Back-project masked depth to 3D point cloud
-            self.get_logger().info('Back-projecting depth to point cloud...')
-            scene_cloud = self.backproject_to_pointcloud(depth, mask, K, rgb)
-
-            if scene_cloud is None:
-                return
-
-            self.get_logger().info(f'Scene cloud: {len(scene_cloud.points)} points')
-
-            # Downsample scene cloud
-            scene_cloud_down = scene_cloud.voxel_down_sample(self.voxel_size)
-            self.get_logger().info(f'Downsampled scene cloud: {len(scene_cloud_down.points)} points')
-
-            # Step 2: Initial alignment (centroid + PCA)
-            self.get_logger().info('Computing initial alignment...')
-            initial_transform = self.compute_initial_alignment(self.model_cloud, scene_cloud_down)
-
-            # Step 3: ICP refinement
-            self.get_logger().info('Running ICP refinement...')
-            final_transform, fitness, rmse = self.run_icp(
-                self.model_cloud, scene_cloud_down, initial_transform)
-
-            self.get_logger().info(f'ICP result: fitness={fitness:.4f}, RMSE={rmse:.6f}')
-
-            # Store last pose
-            self.last_pose = final_transform
-
-            # Publish pose
-            self._publish_pose(final_transform)
-
-            # Publish debug visualization
-            if rgb is not None:
-                self._publish_debug_image(rgb, final_transform, K, mask)
-
-            # Publish point clouds for RViz
-            self._publish_pointclouds(scene_cloud_down, final_transform)
-
-        except Exception as e:
-            self.get_logger().error(f'Pose estimation failed: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-
     def _publish_pose(self, transform: np.ndarray):
         """Publish pose as PoseStamped message in both camera and base frames."""
         stamp = self.get_clock().now().to_msg()
@@ -586,7 +913,7 @@ class ICPPoseNode(Node):
 
             # Draw mask overlay
             mask_overlay = np.zeros_like(vis)
-            mask_overlay[:, :, 1] = mask * 100  # Green tint
+            mask_overlay[:, :, 1] = mask.astype(np.uint8)  # Green tint
             vis = cv2.addWeighted(vis, 0.7, mask_overlay, 0.3, 0)
 
             # Project mesh bounding box corners to image
