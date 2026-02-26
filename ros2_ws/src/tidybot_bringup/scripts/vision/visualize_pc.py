@@ -167,10 +167,10 @@ def main():
     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
     
     # Load depth (prefer .npy if available)
-    if os.path.exists(depth_npy_path):
-        print(f"Loading depth: {depth_npy_path}")
-        depth = np.load(depth_npy_path)
-    elif os.path.exists(depth_path):
+    # if os.path.exists(depth_npy_path):
+    #     print(f"Loading depth: {depth_npy_path}")
+    #     depth = np.load(depth_npy_path)
+    if os.path.exists(depth_path):
         print(f"Loading depth: {depth_path}")
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     else:
