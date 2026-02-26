@@ -596,80 +596,47 @@ class ICPPoseNode(Node):
     def visualize_live(self, rgb_bgr, depth_raw, mask, result):
         """Live visualization during streaming (non-blocking).
         
+        Shows only the ICP result: RGB image with projected 3D bounding box and pose info.
+        
         Args:
             rgb_bgr: Original RGB image in BGR format
-            depth_raw: Raw depth image
-            mask: Binary mask
+            depth_raw: Raw depth image (unused, kept for API compatibility)
+            mask: Binary mask (unused, kept for API compatibility)
             result: Dictionary with pose estimation results
         """
-        h, w = mask.shape[:2]
+        h, w = rgb_bgr.shape[:2]
         
-        # 1. Depth colormap
-        depth_vis = depth_raw.astype(np.float32)
-        depth_vis[depth_vis == 0] = np.nan
-        vmin = np.nanpercentile(depth_vis, 5) if np.any(~np.isnan(depth_vis)) else 0
-        vmax = np.nanpercentile(depth_vis, 95) if np.any(~np.isnan(depth_vis)) else 1
-        depth_normalized = np.clip((depth_raw.astype(np.float32) - vmin) / (vmax - vmin + 1e-6), 0, 1)
-        depth_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        depth_colored[depth_raw == 0] = 0
+        # Create output image (copy of RGB)
+        output = rgb_bgr.copy()
         
-        # 2. Get color tint
-        color_tints = {
-            'red': (0, 0, 255), 'r': (0, 0, 255),
-            'green': (0, 255, 0), 'g': (0, 255, 0),
-            'blue': (255, 0, 0), 'b': (255, 0, 0),
-            'yellow': (0, 255, 255), 'y': (0, 255, 255)
-        }
-        tint = color_tints.get(self.target_color.lower(), (255, 255, 255))
-        
-        # 3. Overlay with mask and pose
-        mask_colored = np.zeros_like(rgb_bgr)
-        mask_colored[mask > 0] = tint
-        overlay = cv2.addWeighted(rgb_bgr.copy(), 0.7, mask_colored, 0.3, 0)
-        
-        # Draw mask contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, tint, 2)
-        
-        # Add pose info if available
+        # Add pose visualization if ICP succeeded
         if result and result.get('transform') is not None:
             transform = result['transform']
             pos = transform[:3, 3]
             fitness = result.get('fitness', 0)
+            rmse = result.get('rmse', 0)
             
-            # Draw projected bounding box
-            self._draw_bbox_on_image(overlay, transform, self.K)
+            # Draw projected 3D bounding box (green wireframe)
+            self._draw_bbox_on_image(output, transform, self.K)
             
-            # Add text
-            text = f'Pos: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})m  Fit: {fitness:.3f}'
-            cv2.putText(overlay, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(overlay, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            # Add pose info text
+            text1 = f'Position: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m'
+            text2 = f'Fitness: {fitness:.4f}  RMSE: {rmse:.6f}'
+            cv2.putText(output, text1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(output, text1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
+            cv2.putText(output, text2, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(output, text2, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
         else:
-            cv2.putText(overlay, 'Pose estimation failed', (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        # Stats
-        stats_text = f'Color: {self.target_color} | Mask: {np.count_nonzero(mask)} | Scene: {result.get("scene_points", 0)}'
-        cv2.putText(overlay, stats_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # 4. Create combined view: RGB | Depth | Overlay
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        combined = np.hstack([rgb_bgr, depth_colored, mask_bgr, overlay])
-        
-        # Add labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(combined, 'RGB', (10, 20), font, 0.5, (255, 255, 255), 1)
-        cv2.putText(combined, 'Depth', (w + 10, 20), font, 0.5, (255, 255, 255), 1)
-        cv2.putText(combined, 'Mask', (2*w + 10, 20), font, 0.5, (255, 255, 255), 1)
-        cv2.putText(combined, 'Pose', (3*w + 10, 20), font, 0.5, (255, 255, 255), 1)
+            cv2.putText(output, 'ICP pose estimation failed', (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         # Resize if too large
-        max_width = 1920
-        if combined.shape[1] > max_width:
-            scale = max_width / combined.shape[1]
-            combined = cv2.resize(combined, None, fx=scale, fy=scale)
+        max_width = 1280
+        if output.shape[1] > max_width:
+            scale = max_width / output.shape[1]
+            output = cv2.resize(output, None, fx=scale, fy=scale)
         
-        cv2.imshow('ICP Pose: RGB | Depth | Mask | Pose', combined)
+        cv2.imshow('ICP Pose Result', output)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
