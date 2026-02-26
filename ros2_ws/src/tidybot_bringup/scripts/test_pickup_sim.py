@@ -28,12 +28,12 @@ import numpy as np
 # Block position in base_link frame
 # World position (0.55, -0.15, 0.025), robot at origin with base_th=π/2
 BLOCK_X = -0.15
-BLOCK_Y = -0.55
+BLOCK_Y = -0.45
 BLOCK_Z = 0.025
 
 # Waypoint heights (above block origin)
 APPROACH_HEIGHT = 0.175   # 15cm above block
-GRASP_HEIGHT = 0.085      # at block top
+GRASP_HEIGHT = 0.03      # at block top
 LIFT_HEIGHT = 0.225       # 20cm above block
 
 # Top-down grasp orientation in base_link frame (quaternion wxyz)
@@ -91,7 +91,7 @@ class TestPickup(Node):
 
         return future.result()
 
-    def plan_and_execute(self, pose, use_orientation=True, duration=2.0):
+    def plan_and_execute(self, pose, use_orientation=True, duration=5.0):
         """Plan and execute a right arm motion to target pose."""
         request = PlanToTarget.Request()
         request.arm_name = 'right'
@@ -138,33 +138,33 @@ class TestPickup(Node):
         self.get_logger().info('Step 2: Moving above block (approach)')
         pose_approach = self.create_pose(
             BLOCK_X, BLOCK_Y, APPROACH_HEIGHT, qw, qx, qy, qz)
-        success = self.plan_and_execute(pose_approach, use_orientation=True, duration=2.0)
+        success = self.plan_and_execute(pose_approach, use_orientation=True, duration=5.0)
         if not success:
             self.get_logger().warn('Approach failed, retrying without orientation...')
-            success = self.plan_and_execute(pose_approach, use_orientation=False, duration=2.0)
+            success = self.plan_and_execute(pose_approach, use_orientation=False, duration=5.0)
             if not success:
                 self.get_logger().error('Approach failed! Aborting.')
                 return
-        time.sleep(2.5)
+        time.sleep(20)
 
         # --- DESCEND ---
         self.get_logger().info('-' * 40)
         self.get_logger().info('Step 3: Descending to grasp height')
         pose_grasp = self.create_pose(
             BLOCK_X, BLOCK_Y, GRASP_HEIGHT, qw, qx, qy, qz)
-        success = self.plan_and_execute(pose_grasp, use_orientation=True, duration=2.0)
+        success = self.plan_and_execute(pose_grasp, use_orientation=True, duration=5.0)
         if not success:
             self.get_logger().warn('Descend failed, retrying without orientation...')
-            success = self.plan_and_execute(pose_grasp, use_orientation=False, duration=2.0)
+            success = self.plan_and_execute(pose_grasp, use_orientation=False, duration=5.0)
             if not success:
                 self.get_logger().error('Descend failed! Aborting.')
                 return
-        time.sleep(2.5)
+        time.sleep(20)
 
         # --- CLOSE GRIPPER + CHECK GRASP ---
         self.get_logger().info('-' * 40)
         self.get_logger().info('Step 4: Closing gripper and checking grasp')
-        grasped = self.gripper.close_and_check('right', duration=1.5)
+        grasped = self.gripper.close_and_check('right', duration=5)
         self.get_logger().info(f'  Grasp detected: {grasped}')
 
         # --- LIFT ---
@@ -172,11 +172,11 @@ class TestPickup(Node):
         self.get_logger().info('Step 5: Lifting block')
         pose_lift = self.create_pose(
             BLOCK_X, BLOCK_Y, LIFT_HEIGHT, qw, qx, qy, qz)
-        success = self.plan_and_execute(pose_lift, use_orientation=True, duration=2.0)
+        success = self.plan_and_execute(pose_lift, use_orientation=True, duration=5.0)
         if not success:
             self.get_logger().warn('Lift failed, retrying without orientation...')
-            self.plan_and_execute(pose_lift, use_orientation=False, duration=2.0)
-        time.sleep(2.5)
+            self.plan_and_execute(pose_lift, use_orientation=False, duration=5.0)
+        time.sleep(20)
 
         # --- DONE ---
         self.get_logger().info('-' * 40)
