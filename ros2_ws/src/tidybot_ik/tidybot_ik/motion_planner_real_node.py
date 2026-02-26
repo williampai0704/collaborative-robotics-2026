@@ -67,8 +67,8 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('min_collision_distance', 0.05)  # Safe distance boundary (5cm)
         self.declare_parameter('ik_damping', 1e-5)
         self.declare_parameter('max_ik_seeds', 7)
-        self.declare_parameter('workspace_min', [0.2, -0.5, 0.0])
-        self.declare_parameter('workspace_max', [0.8, 0.5, 0.6])
+        self.declare_parameter('workspace_min', [-0.2, -0.5, 0.0])
+        self.declare_parameter('workspace_max', [0.8, 0.5, 0.8])
         self.declare_parameter('workspace_frame', 'base_link')
 
         # Retrieve parameters
