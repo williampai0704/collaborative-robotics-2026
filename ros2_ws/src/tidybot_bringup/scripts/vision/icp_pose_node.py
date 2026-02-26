@@ -83,8 +83,121 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+# Also add the source directory (for when running from install location)
+SOURCE_VISION_DIR = '/home/cdc/collaborative-robotics-2026/ros2_ws/src/tidybot_bringup/scripts/vision'
+if SOURCE_VISION_DIR not in sys.path:
+    sys.path.insert(0, SOURCE_VISION_DIR)
+
 from color_mask import color_mask
-from visualize_pc import depth_to_pointcloud, load_camera_intrinsics, DEFAULT_DEPTH_FX, DEFAULT_DEPTH_FY, DEFAULT_DEPTH_CX, DEFAULT_DEPTH_CY
+
+# Default depth camera intrinsics (RealSense D435 at 640x480)
+DEFAULT_DEPTH_FX = 384.0
+DEFAULT_DEPTH_FY = 384.0
+DEFAULT_DEPTH_CX = 320.0
+DEFAULT_DEPTH_CY = 240.0
+
+# Default RGB camera intrinsics
+DEFAULT_RGB_FX = 615.0
+DEFAULT_RGB_FY = 615.0
+DEFAULT_RGB_CX = 320.0
+DEFAULT_RGB_CY = 240.0
+
+# Default depth-to-RGB translation (RealSense D435: ~15mm offset)
+DEFAULT_DEPTH_TO_RGB_TX = 0.015  # meters
+
+
+def load_camera_intrinsics(meta_path):
+    """Load RGB camera intrinsics from meta.mat file if available."""
+    try:
+        import scipy.io
+        meta = scipy.io.loadmat(meta_path)
+        if 'K' in meta:
+            K = meta['K']
+            return K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        elif 'intrinsic_matrix' in meta:
+            K = meta['intrinsic_matrix']
+            return K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    except Exception:
+        pass
+    return DEFAULT_RGB_FX, DEFAULT_RGB_FY, DEFAULT_RGB_CX, DEFAULT_RGB_CY
+
+
+def depth_to_pointcloud_unaligned(rgb, depth, 
+                                   depth_fx, depth_fy, depth_cx, depth_cy,
+                                   rgb_fx, rgb_fy, rgb_cx, rgb_cy,
+                                   mask=None, depth_scale=1.0, min_depth=0.001, max_depth=10.0):
+    """Convert unaligned RGB-D images to colored point cloud.
+    
+    Creates geometry from depth camera frame and projects each 3D point
+    to RGB image to get its color. This handles the case where depth and
+    RGB cameras have different intrinsics and a physical offset.
+    
+    Args:
+        rgb: RGB image (H, W, 3) uint8
+        depth: Depth image (H, W) - can be uint16 (mm) or float (m)
+        depth_fx, depth_fy, depth_cx, depth_cy: Depth camera intrinsics
+        rgb_fx, rgb_fy, rgb_cx, rgb_cy: RGB camera intrinsics
+        mask: Optional binary mask (in RGB frame) to filter points
+        depth_scale: Scale factor (1.0 if already in meters, 1000.0 for mm to m)
+        min_depth: Minimum valid depth in meters
+        max_depth: Maximum valid depth in meters
+    
+    Returns:
+        Open3D PointCloud with colors, or None if not enough points
+    """
+    h, w = depth.shape
+    rgb_h, rgb_w = rgb.shape[:2]
+    
+    # Convert depth to meters if needed
+    if depth.dtype == np.uint16:
+        depth_m = depth.astype(np.float32) / depth_scale
+    elif depth_scale != 1.0:
+        depth_m = depth.astype(np.float32) / depth_scale
+    else:
+        depth_m = depth.astype(np.float32)
+    
+    # Create pixel coordinate grids for depth image
+    u_d, v_d = np.meshgrid(np.arange(w), np.arange(h))
+    
+    # Back-project depth pixels to 3D points in depth camera frame
+    z = depth_m
+    x = (u_d - depth_cx) * z / depth_fx
+    y = (v_d - depth_cy) * z / depth_fy
+    
+    # Stack into (H*W, 3) points
+    points_depth = np.stack([x.flatten(), y.flatten(), z.flatten()], axis=1)
+    
+    # Transform points from depth frame to RGB frame (15mm X offset for D435)
+    points_rgb = points_depth + np.array([DEFAULT_DEPTH_TO_RGB_TX, 0.0, 0.0])
+    
+    # Project 3D points to RGB image plane
+    z_rgb = points_rgb[:, 2]
+    # Avoid division by zero
+    z_rgb_safe = np.where(z_rgb > 0.001, z_rgb, 0.001)
+    u_rgb = (points_rgb[:, 0] * rgb_fx / z_rgb_safe + rgb_cx).astype(np.int32)
+    v_rgb = (points_rgb[:, 1] * rgb_fy / z_rgb_safe + rgb_cy).astype(np.int32)
+    
+    # Valid points: positive depth, within RGB image bounds
+    valid = (z.flatten() > min_depth) & (z.flatten() < max_depth)
+    valid = valid & (u_rgb >= 0) & (u_rgb < rgb_w) & (v_rgb >= 0) & (v_rgb < rgb_h)
+    
+    # Get colors from RGB image
+    colors = np.zeros((len(points_depth), 3), dtype=np.float32)
+    valid_indices = np.where(valid)[0]
+    colors[valid_indices] = rgb[v_rgb[valid_indices], u_rgb[valid_indices]].astype(np.float32) / 255.0
+    
+    # Apply mask if provided (mask is in RGB frame)
+    if mask is not None:
+        mask_valid = np.zeros(len(points_depth), dtype=bool)
+        mask_valid[valid_indices] = mask[v_rgb[valid_indices], u_rgb[valid_indices]] > 0
+        valid = valid & mask_valid
+    
+    # Filter and create point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_depth[valid])
+    pcd.colors = o3d.utility.Vector3dVector(colors[valid])
+    
+    return pcd
 
 # Optional imports for point cloud processing
 try:
@@ -128,8 +241,10 @@ class ICPPoseNode(Node):
         self.declare_parameter('icp_threshold', 1e-6)
         self.declare_parameter('voxel_size', 0.005)  # 5mm
         self.declare_parameter('depth_scale', 1000.0)  # mm to m
+        self.declare_parameter('mesh_scale', 0.01)  # Scale factor for mesh (0.01 for cm->m, 0.001 for mm->m)
         self.declare_parameter('min_points', 100)  # Minimum points for ICP
         self.declare_parameter('use_color_icp', False)  # Use color information in ICP
+        self.declare_parameter('use_pca_alignment', False)  # Use PCA for initial rotation (disable for symmetric objects)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
 
@@ -146,8 +261,10 @@ class ICPPoseNode(Node):
         self.depth_scale = self.get_parameter('depth_scale').get_parameter_value().double_value
         self.min_points = self.get_parameter('min_points').get_parameter_value().integer_value
         self.use_color_icp = self.get_parameter('use_color_icp').get_parameter_value().bool_value
+        self.use_pca_alignment = self.get_parameter('use_pca_alignment').get_parameter_value().bool_value
         self.camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
+        self.mesh_scale = self.get_parameter('mesh_scale').get_parameter_value().double_value
 
         if not mesh_file:
             self.get_logger().error('mesh_file parameter is required!')
@@ -229,6 +346,7 @@ class ICPPoseNode(Node):
         self.get_logger().info('=' * 50)
         self.get_logger().info('ICP Pose Estimation Node Initialized')
         self.get_logger().info(f'  Mesh: {mesh_file}')
+        self.get_logger().info(f'  Mesh scale: {self.mesh_scale} (0.01 for cm->m, 0.001 for mm->m)')
         self.get_logger().info(f'  Model points: {len(self.model_cloud.points)}')
         self.get_logger().info(f'  Voxel size: {self.voxel_size}m')
         self.get_logger().info(f'  ICP iterations: {self.icp_max_iterations}')
@@ -395,31 +513,61 @@ class ICPPoseNode(Node):
         if result and result.get('scene_cloud') is not None:
             self.get_logger().info('Opening 3D visualization...')
             self.get_logger().info('Controls: Left-drag=Rotate, Right-drag=Pan, Scroll=Zoom, Q=Quit')
+            self.get_logger().info('Legend:')
+            self.get_logger().info('  - Colored points: Scene point cloud (from depth + RGB)')
+            self.get_logger().info('  - RED points: Model transformed by ICP result')
+            self.get_logger().info('  - Small coord frame: At estimated object pose')
+            self.get_logger().info('  - Large coord frame: Camera origin (0,0,0)')
             
             geometries = []
             
-            # Scene point cloud (colored)
+            # Scene point cloud (colored from RGB)
             scene_cloud = result['scene_cloud']
             geometries.append(scene_cloud)
             
-            # Model point cloud (transformed, painted red for visibility)
+            # Model point cloud with INITIAL alignment (blue) - to see if initial guess is reasonable
+            if result.get('initial_transform') is not None:
+                init_transform = result['initial_transform']
+                model_initial = o3d.geometry.PointCloud(self.model_cloud)
+                model_initial.transform(init_transform)
+                model_initial.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
+                geometries.append(model_initial)
+                self.get_logger().info('BLUE points: Model with initial alignment (before ICP)')
+            
+            # Model point cloud with FINAL transform (red) - ICP result
             if result.get('transform') is not None:
+                transform = result['transform']
                 model_transformed = o3d.geometry.PointCloud(self.model_cloud)
-                model_transformed.transform(result['transform'])
+                model_transformed.transform(transform)
                 model_transformed.paint_uniform_color([1.0, 0.0, 0.0])  # Red
                 geometries.append(model_transformed)
-            
-            # Coordinate frame at estimated pose
-            if result.get('transform') is not None:
+                self.get_logger().info('RED points: Model with ICP result (final)')
+                
+                # Log transform details
+                pos = transform[:3, 3]
+                self.get_logger().info(f'ICP Transform position: ({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}) m')
+                
+                # Coordinate frame at the CENTROID of transformed model (not mesh origin)
+                # This shows where the object center actually is
+                transformed_centroid = np.asarray(model_transformed.points).mean(axis=0)
                 coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                    size=0.05, origin=[0, 0, 0])
-                coord_frame.transform(result['transform'])
+                    size=0.03, origin=transformed_centroid)
                 geometries.append(coord_frame)
+                self.get_logger().info(f'Object centroid (red frame): ({transformed_centroid[0]:.4f}, {transformed_centroid[1]:.4f}, {transformed_centroid[2]:.4f}) m')
             
-            # Origin coordinate frame
+            # Camera origin coordinate frame (larger, for reference)
             origin_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=0.1, origin=[0, 0, 0])
+                size=0.05, origin=[0, 0, 0])
             geometries.append(origin_frame)
+            
+            # Print scene cloud stats for debugging
+            scene_pts = np.asarray(scene_cloud.points)
+            self.get_logger().info(f'Scene cloud centroid: ({scene_pts.mean(axis=0)[0]:.4f}, {scene_pts.mean(axis=0)[1]:.4f}, {scene_pts.mean(axis=0)[2]:.4f}) m')
+            self.get_logger().info(f'Scene cloud Z range: {scene_pts[:, 2].min():.4f} - {scene_pts[:, 2].max():.4f} m')
+            
+            model_pts = np.asarray(self.model_cloud.points)
+            self.get_logger().info(f'Model cloud (untransformed) centroid: ({model_pts.mean(axis=0)[0]:.4f}, {model_pts.mean(axis=0)[1]:.4f}, {model_pts.mean(axis=0)[2]:.4f}) m')
+            self.get_logger().info(f'Model cloud extents: {model_pts.max(axis=0) - model_pts.min(axis=0)} m')
             
             # Show 3D visualization
             o3d.visualization.draw_geometries(
@@ -474,15 +622,33 @@ class ICPPoseNode(Node):
             self.get_logger().warn(f'Failed to draw bbox: {e}')
 
     def _load_mesh_as_pointcloud(self, mesh_file: str) -> o3d.geometry.PointCloud:
-        """Load mesh and sample points to create model point cloud."""
+        """Load mesh and sample points to create model point cloud.
+        
+        The mesh is scaled by mesh_scale parameter and CENTERED at the origin.
+        - mesh_scale=0.01 (default): mesh is in centimeters
+        - mesh_scale=0.001: mesh is in millimeters
+        - mesh_scale=1.0: mesh is already in meters
+        """
         try:
             # Load mesh with trimesh (handles more formats)
             mesh = trimesh.load(mesh_file)
             self.get_logger().info(f'Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces')
+            
+            # Apply scale if needed (e.g., convert mm to m)
+            if self.mesh_scale != 1.0:
+                mesh.apply_scale(self.mesh_scale)
+                self.get_logger().info(f'Applied mesh scale: {self.mesh_scale} (mesh units -> meters)')
+            
+            # Center mesh at origin (important for proper ICP alignment!)
+            # This ensures the model centroid is at (0,0,0)
+            mesh_centroid = mesh.centroid
+            mesh.vertices -= mesh_centroid
+            self.get_logger().info(f'Centered mesh at origin (shifted by {mesh_centroid})')
 
             # Sample points uniformly from mesh surface
             points, face_indices = trimesh.sample.sample_surface(mesh, self.num_mesh_samples)
             self.get_logger().info(f'Sampled {len(points)} points from mesh surface')
+            self.get_logger().info(f'Mesh extents after scaling: {mesh.extents} meters')
 
             # Get colors if available (from vertex colors or face colors)
             colors = None
@@ -595,6 +761,7 @@ class ICPPoseNode(Node):
         """
         result = {
             'transform': None,
+            'initial_transform': None,
             'fitness': 0,
             'rmse': 0,
             'scene_cloud': None,
@@ -619,9 +786,15 @@ class ICPPoseNode(Node):
             self.get_logger().info(f'Downsampled scene cloud: {len(scene_cloud_down.points)} points')
             result['scene_cloud'] = scene_cloud_down
 
-            # Step 2: Initial alignment (centroid + PCA)
-            self.get_logger().info('Computing initial alignment...')
-            initial_transform = self.compute_initial_alignment(self.model_cloud, scene_cloud_down)
+            # Step 2: Initial alignment (centroid matching, optionally with PCA rotation)
+            alignment_type = "centroid + PCA" if self.use_pca_alignment else "centroid only (no rotation)"
+            self.get_logger().info(f'Computing initial alignment ({alignment_type})...')
+            initial_transform = self.compute_initial_alignment(
+                self.model_cloud, scene_cloud_down, use_pca=self.use_pca_alignment)
+            result['initial_transform'] = initial_transform
+            
+            init_pos = initial_transform[:3, 3]
+            self.get_logger().info(f'Initial alignment position: ({init_pos[0]:.4f}, {init_pos[1]:.4f}, {init_pos[2]:.4f}) m')
 
             # Step 3: ICP refinement
             self.get_logger().info('Running ICP refinement...')
@@ -629,6 +802,8 @@ class ICPPoseNode(Node):
                 self.model_cloud, scene_cloud_down, initial_transform)
 
             self.get_logger().info(f'ICP result: fitness={fitness:.4f}, RMSE={rmse:.6f}')
+            final_pos = final_transform[:3, 3]
+            self.get_logger().info(f'Final position: ({final_pos[0]:.4f}, {final_pos[1]:.4f}, {final_pos[2]:.4f}) m')
             
             result['transform'] = final_transform
             result['fitness'] = fitness
@@ -659,47 +834,50 @@ class ICPPoseNode(Node):
                                    K: np.ndarray, rgb: np.ndarray = None) -> o3d.geometry.PointCloud:
         """
         Back-project masked depth pixels to 3D point cloud.
+        
+        Uses the unaligned depth-to-pointcloud function that handles the physical
+        offset between depth and RGB cameras on RealSense D435.
 
         Args:
             depth: Depth image (H, W) in meters
             mask: Binary mask (H, W)
-            K: Camera intrinsic matrix (3, 3)
+            K: Camera intrinsic matrix (3, 3) - RGB camera intrinsics
             rgb: Optional RGB image for coloring points
 
         Returns:
-            Open3D PointCloud in camera frame
+            Open3D PointCloud in depth camera frame, or None if not enough points
         """
-        H, W = depth.shape[:2]
-
-        # Get valid pixels (masked and valid depth)
-        valid = (mask > 0) & (depth > 0.001) & (depth < 10.0)  # 1mm to 10m
-        vs, us = np.where(valid)
-
-        if len(us) < self.min_points:
-            self.get_logger().warn(f'Not enough valid points: {len(us)} < {self.min_points}')
+        if rgb is None:
+            self.get_logger().warn('RGB image required for point cloud generation')
             return None
-
-        # Get depth values
-        zs = depth[vs, us]
-
-        # Back-project to 3D
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-
-        xs = (us - cx) * zs / fx
-        ys = (vs - cy) * zs / fy
-
-        points = np.stack([xs, ys, zs], axis=1)
-
-        # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-
-        # Add colors if available
-        if rgb is not None:
-            colors = rgb[vs, us, :] / 255.0
-            pcd.colors = o3d.utility.Vector3dVector(colors)
-
+        
+        # Extract RGB intrinsics from K matrix
+        rgb_fx, rgb_fy = K[0, 0], K[1, 1]
+        rgb_cx, rgb_cy = K[0, 2], K[1, 2]
+        
+        # Use the unaligned depth-to-pointcloud function
+        # depth_scale=1.0 because depth is already in meters
+        pcd = depth_to_pointcloud_unaligned(
+            rgb=rgb,
+            depth=depth,
+            depth_fx=DEFAULT_DEPTH_FX,
+            depth_fy=DEFAULT_DEPTH_FY,
+            depth_cx=DEFAULT_DEPTH_CX,
+            depth_cy=DEFAULT_DEPTH_CY,
+            rgb_fx=rgb_fx,
+            rgb_fy=rgb_fy,
+            rgb_cx=rgb_cx,
+            rgb_cy=rgb_cy,
+            mask=mask,
+            depth_scale=1.0,  # Already in meters
+            min_depth=0.001,
+            max_depth=10.0
+        )
+        
+        if pcd is None or len(pcd.points) < self.min_points:
+            self.get_logger().warn(f'Not enough valid points: {len(pcd.points) if pcd else 0} < {self.min_points}')
+            return None
+        
         # Estimate normals
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
             radius=self.voxel_size * 2, max_nn=30))
@@ -707,13 +885,16 @@ class ICPPoseNode(Node):
         return pcd
 
     def compute_initial_alignment(self, source: o3d.geometry.PointCloud,
-                                   target: o3d.geometry.PointCloud) -> np.ndarray:
+                                   target: o3d.geometry.PointCloud,
+                                   use_pca: bool = False) -> np.ndarray:
         """
-        Compute initial alignment using centroid matching and PCA.
+        Compute initial alignment using centroid matching (and optionally PCA).
 
         Args:
             source: Model point cloud (to be transformed)
             target: Scene point cloud (reference)
+            use_pca: If True, also align principal axes. If False, only translate
+                     centroids (more robust for symmetric objects or shape mismatch)
 
         Returns:
             4x4 transformation matrix
@@ -722,15 +903,25 @@ class ICPPoseNode(Node):
         source_pts = np.asarray(source.points)
         target_pts = np.asarray(target.points)
 
-        # Step 1: Centroid alignment
+        # Step 1: Centroid alignment (always done)
         source_centroid = source_pts.mean(axis=0)
         target_centroid = target_pts.mean(axis=0)
 
+        if not use_pca:
+            # Simple translation-only alignment (no rotation)
+            # This is more robust for:
+            # - Symmetric objects (cubes, spheres)
+            # - Shape mismatches
+            # - Partial views
+            T = np.eye(4)
+            T[:3, 3] = target_centroid - source_centroid
+            return T
+
+        # Step 2: PCA for orientation alignment (optional)
         # Center the point clouds
         source_centered = source_pts - source_centroid
         target_centered = target_pts - target_centroid
 
-        # Step 2: PCA for orientation alignment
         # Compute covariance matrices
         source_cov = np.cov(source_centered.T)
         target_cov = np.cov(target_centered.T)
@@ -943,15 +1134,19 @@ class ICPPoseNode(Node):
             axes = np.eye(3) * axis_length
             axes_transformed = (transform[:3, :3] @ axes.T).T + origin
 
-            origin_2d = (K @ origin).astype(int)
-            origin_2d = (origin_2d[0] // origin_2d[2], origin_2d[1] // origin_2d[2])
+            origin_2d_raw = K @ origin
+            if origin_2d_raw[2] > 0.001:  # Only draw if in front of camera
+                origin_2d = (int(origin_2d_raw[0] / origin_2d_raw[2]), 
+                             int(origin_2d_raw[1] / origin_2d_raw[2]))
 
-            colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # RGB for XYZ
-            for i, color in enumerate(colors):
-                end = axes_transformed[i]
-                end_2d = (K @ end).astype(int)
-                end_2d = (end_2d[0] // end_2d[2], end_2d[1] // end_2d[2])
-                cv2.arrowedLine(vis, origin_2d, end_2d, color, 2, tipLength=0.2)
+                colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # RGB for XYZ
+                for i, color in enumerate(colors):
+                    end = axes_transformed[i]
+                    end_2d_raw = K @ end
+                    if end_2d_raw[2] > 0.001:
+                        end_2d = (int(end_2d_raw[0] / end_2d_raw[2]), 
+                                  int(end_2d_raw[1] / end_2d_raw[2]))
+                        cv2.arrowedLine(vis, origin_2d, end_2d, color, 2, tipLength=0.2)
 
             # Convert to ROS message
             debug_msg = self.bridge.cv2_to_imgmsg(vis, 'rgb8')
@@ -989,8 +1184,9 @@ class ICPPoseNode(Node):
         scene_msg = self._pointcloud_to_ros(scene_cloud, stamp, frame_id)
         self.scene_cloud_pub.publish(scene_msg)
 
-        # Transform and publish model cloud
-        model_transformed = self.model_cloud.transform(transform)
+        # Transform and publish model cloud (copy first to avoid modifying original!)
+        model_transformed = o3d.geometry.PointCloud(self.model_cloud)
+        model_transformed.transform(transform)
         model_msg = self._pointcloud_to_ros(model_transformed, stamp, frame_id)
         self.model_cloud_pub.publish(model_msg)
 

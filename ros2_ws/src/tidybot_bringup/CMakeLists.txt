@@ -39,6 +39,9 @@ install(PROGRAMS
   scripts/trajectory_tracking.py
   # Vision scripts
   scripts/vision/icp_pose_node.py
+  scripts/vision/find_center.py
+  scripts/vision/color_mask.py
+  scripts/vision/obj_dist.py
   scripts/vision/testing/test_camera_smoke.py
   scripts/vision/testing/test_capture_dataset.py
   scripts/vision/testing/test_pan_tilt_sweep.py
