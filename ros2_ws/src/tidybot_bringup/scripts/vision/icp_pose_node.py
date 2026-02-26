@@ -51,6 +51,10 @@ Usage:
     ros2 run tidybot_bringup icp_pose_node.py --ros-args \
         -p mesh_file:=/path/to/object.obj
 
+    # With live visualization
+    ros2 run tidybot_bringup icp_pose_node.py --ros-args \
+        -p mesh_file:=/path/to/object.obj -p visualize:=true
+
     # Debug mode (from test_data)
     ros2 run tidybot_bringup icp_pose_node.py --ros-args \
         -p mesh_file:=/path/to/object.obj \
@@ -247,6 +251,7 @@ class ICPPoseNode(Node):
         self.declare_parameter('use_pca_alignment', False)  # Use PCA for initial rotation (disable for symmetric objects)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('visualize', False)  # Enable live visualization
 
         # Get parameters
         mesh_file = self.get_parameter('mesh_file').get_parameter_value().string_value
@@ -265,6 +270,11 @@ class ICPPoseNode(Node):
         self.camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
         self.base_frame = self.get_parameter('base_frame').get_parameter_value().string_value
         self.mesh_scale = self.get_parameter('mesh_scale').get_parameter_value().double_value
+        self.visualize = self.get_parameter('visualize').get_parameter_value().bool_value
+        
+        # Store for visualization
+        self.latest_rgb_bgr = None
+        self.latest_depth_raw = None
 
         if not mesh_file:
             self.get_logger().error('mesh_file parameter is required!')
@@ -352,6 +362,8 @@ class ICPPoseNode(Node):
         self.get_logger().info(f'  ICP iterations: {self.icp_max_iterations}')
         self.get_logger().info(f'  Debug mode: {self.debug}')
         self.get_logger().info(f'  Mask mode: {"SAM3" if self.use_sam3_mask else f"color ({self.target_color})"}')
+        if self.visualize:
+            self.get_logger().info('  Visualization: ENABLED - Press "q" to quit')
         self.get_logger().info('=' * 50)
 
     def debug_process(self):
@@ -581,6 +593,90 @@ class ICPPoseNode(Node):
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
+    def visualize_live(self, rgb_bgr, depth_raw, mask, result):
+        """Live visualization during streaming (non-blocking).
+        
+        Args:
+            rgb_bgr: Original RGB image in BGR format
+            depth_raw: Raw depth image
+            mask: Binary mask
+            result: Dictionary with pose estimation results
+        """
+        h, w = mask.shape[:2]
+        
+        # 1. Depth colormap
+        depth_vis = depth_raw.astype(np.float32)
+        depth_vis[depth_vis == 0] = np.nan
+        vmin = np.nanpercentile(depth_vis, 5) if np.any(~np.isnan(depth_vis)) else 0
+        vmax = np.nanpercentile(depth_vis, 95) if np.any(~np.isnan(depth_vis)) else 1
+        depth_normalized = np.clip((depth_raw.astype(np.float32) - vmin) / (vmax - vmin + 1e-6), 0, 1)
+        depth_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        depth_colored[depth_raw == 0] = 0
+        
+        # 2. Get color tint
+        color_tints = {
+            'red': (0, 0, 255), 'r': (0, 0, 255),
+            'green': (0, 255, 0), 'g': (0, 255, 0),
+            'blue': (255, 0, 0), 'b': (255, 0, 0),
+            'yellow': (0, 255, 255), 'y': (0, 255, 255)
+        }
+        tint = color_tints.get(self.target_color.lower(), (255, 255, 255))
+        
+        # 3. Overlay with mask and pose
+        mask_colored = np.zeros_like(rgb_bgr)
+        mask_colored[mask > 0] = tint
+        overlay = cv2.addWeighted(rgb_bgr.copy(), 0.7, mask_colored, 0.3, 0)
+        
+        # Draw mask contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, tint, 2)
+        
+        # Add pose info if available
+        if result and result.get('transform') is not None:
+            transform = result['transform']
+            pos = transform[:3, 3]
+            fitness = result.get('fitness', 0)
+            
+            # Draw projected bounding box
+            self._draw_bbox_on_image(overlay, transform, self.K)
+            
+            # Add text
+            text = f'Pos: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})m  Fit: {fitness:.3f}'
+            cv2.putText(overlay, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        else:
+            cv2.putText(overlay, 'Pose estimation failed', (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Stats
+        stats_text = f'Color: {self.target_color} | Mask: {np.count_nonzero(mask)} | Scene: {result.get("scene_points", 0)}'
+        cv2.putText(overlay, stats_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # 4. Create combined view: RGB | Depth | Overlay
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        combined = np.hstack([rgb_bgr, depth_colored, mask_bgr, overlay])
+        
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(combined, 'RGB', (10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Depth', (w + 10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Mask', (2*w + 10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Pose', (3*w + 10, 20), font, 0.5, (255, 255, 255), 1)
+        
+        # Resize if too large
+        max_width = 1920
+        if combined.shape[1] > max_width:
+            scale = max_width / combined.shape[1]
+            combined = cv2.resize(combined, None, fx=scale, fy=scale)
+        
+        cv2.imshow('ICP Pose: RGB | Depth | Mask | Pose', combined)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            self.get_logger().info('Quit key pressed, disabling visualization')
+            self.visualize = False
+            cv2.destroyAllWindows()
+
     def _draw_bbox_on_image(self, image, transform, K):
         """Draw projected 3D bounding box on image."""
         try:
@@ -684,6 +780,7 @@ class ICPPoseNode(Node):
         try:
             with self.lock:
                 self.rgb_image = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
+                self.latest_rgb_bgr = cv2.cvtColor(self.rgb_image, cv2.COLOR_RGB2BGR)
                 self.new_data_received = True
         except Exception as e:
             self.get_logger().warn(f'Failed to convert RGB image: {e}')
@@ -693,6 +790,7 @@ class ICPPoseNode(Node):
         try:
             with self.lock:
                 depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+                self.latest_depth_raw = depth.copy()  # Store raw for visualization
                 # Convert to meters
                 if depth.dtype == np.uint16:
                     self.depth_image = depth.astype(np.float32) / self.depth_scale
@@ -724,6 +822,8 @@ class ICPPoseNode(Node):
         with self.lock:
             rgb = self.rgb_image
             depth = self.depth_image
+            depth_raw = self.latest_depth_raw
+            rgb_bgr = self.latest_rgb_bgr
             K = self.K
             sam3_mask = self.object_mask
             new_data = self.new_data_received
@@ -744,9 +844,9 @@ class ICPPoseNode(Node):
         else:
             mask = color_mask(rgb, self.target_color)
 
-        self.run_pose_estimation(rgb, depth, mask)
+        self.run_pose_estimation(rgb, depth, mask, rgb_bgr=rgb_bgr, depth_raw=depth_raw)
 
-    def run_pose_estimation(self, rgb, depth, mask, return_result=False):
+    def run_pose_estimation(self, rgb, depth, mask, return_result=False, rgb_bgr=None, depth_raw=None):
         """Run the full pose estimation pipeline.
         
         Args:
@@ -754,6 +854,8 @@ class ICPPoseNode(Node):
             depth: Depth image in meters
             mask: Binary mask
             return_result: If True, return dict with results for visualization
+            rgb_bgr: BGR image for visualization (optional)
+            depth_raw: Raw depth image for visualization (optional)
             
         Returns:
             If return_result: dict with 'transform', 'fitness', 'rmse', 'scene_cloud', 'scene_points'
@@ -826,6 +928,10 @@ class ICPPoseNode(Node):
             self.get_logger().error(f'Pose estimation failed: {e}')
             import traceback
             self.get_logger().error(traceback.format_exc())
+        
+        # Live visualization (non-blocking)
+        if self.visualize and rgb_bgr is not None and depth_raw is not None:
+            self.visualize_live(rgb_bgr, depth_raw, mask, result)
         
         if return_result:
             return result
@@ -1245,6 +1351,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 

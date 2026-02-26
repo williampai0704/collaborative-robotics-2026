@@ -12,6 +12,9 @@ Usage:
     # Normal mode (from topics)
     ros2 run tidybot_bringup obj_dist.py
 
+    # With live visualization
+    ros2 run tidybot_bringup obj_dist.py --ros-args -p visualize:=true
+
     # Debug mode (from test_data)
     ros2 run tidybot_bringup obj_dist.py --ros-args -p debug:=true -p debug_pair:=0
 
@@ -58,18 +61,21 @@ class ObjectDistanceNode(Node):
         self.declare_parameter('debug_pair', 0)
         self.declare_parameter('target_color', 'r')
         self.declare_parameter('use_sam3_mask', False)
+        self.declare_parameter('visualize', False)  # Enable live visualization
 
         # Get parameters
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
         self.debug_pair = self.get_parameter('debug_pair').get_parameter_value().integer_value
         self.target_color = self.get_parameter('target_color').get_parameter_value().string_value
         self.use_sam3_mask = self.get_parameter('use_sam3_mask').get_parameter_value().bool_value
+        self.visualize = self.get_parameter('visualize').get_parameter_value().bool_value
 
         self.cv_bridge = CvBridge()
         self.distance_pub = self.create_publisher(Float32, "/vision/object_distance", 10)
 
         self.latest_depth = None
         self.latest_rgb = None
+        self.latest_rgb_bgr = None  # For visualization
         self.latest_mask = None  # For SAM3 mask mode
 
         if self.debug:
@@ -89,6 +95,9 @@ class ObjectDistanceNode(Node):
                 # Color mask mode
                 self.get_logger().info(f'Using color mask (target: {self.target_color})')
                 self.create_subscription(Image, "/camera/color/image_raw", self._rgb_callback, 10)
+
+        if self.visualize:
+            self.get_logger().info('Visualization ENABLED - Press "q" to quit')
 
         self.get_logger().info('object_distance_node started')
 
@@ -126,13 +135,13 @@ class ObjectDistanceNode(Node):
         self.get_logger().info(f'Generated color mask, non-zero pixels: {np.count_nonzero(mask)}')
 
         # Compute distance and get stats
-        distance_m, stats = self.compute_distance(depth, mask, return_stats=True)
+        distance_m, stats = self.compute_distance(depth, mask, rgb_bgr=rgb_bgr, return_stats=True)
 
-        # Visualize results
-        self.visualize_debug(rgb_bgr, depth, mask, distance_m, stats)
+        # Visualize results (blocking for debug mode)
+        self.visualize_frame(rgb_bgr, depth, mask, distance_m, stats, blocking=True)
 
-    def visualize_debug(self, rgb_bgr, depth, mask, distance_m, stats):
-        """Visualize debug results with OpenCV windows.
+    def visualize_frame(self, rgb_bgr, depth, mask, distance_m, stats, blocking=False):
+        """Visualize results with OpenCV windows.
         
         Args:
             rgb_bgr: Original RGB image in BGR format
@@ -140,6 +149,7 @@ class ObjectDistanceNode(Node):
             mask: Binary mask
             distance_m: Computed distance in meters (None if failed)
             stats: Dictionary with statistics
+            blocking: If True, wait for key press. If False, use waitKey(1) for streaming.
         """
         h, w = mask.shape[:2]
         
@@ -152,7 +162,7 @@ class ObjectDistanceNode(Node):
         depth_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
         depth_colored[depth == 0] = 0  # Black for invalid depth
         
-        # 2. Mask visualization (tinted with target color)
+        # 2. Get color tint
         color_tints = {
             'red': (0, 0, 255), 'r': (0, 0, 255),
             'green': (0, 255, 0), 'g': (0, 255, 0),
@@ -160,75 +170,61 @@ class ObjectDistanceNode(Node):
             'yellow': (0, 255, 255), 'y': (0, 255, 255)
         }
         tint = color_tints.get(self.target_color.lower(), (255, 255, 255))
+        
+        # 3. Overlay: RGB with mask
         mask_colored = np.zeros_like(rgb_bgr)
         mask_colored[mask > 0] = tint
-        
-        # 3. Masked depth visualization
-        masked_depth = depth_colored.copy()
-        masked_depth[mask == 0] = 0  # Only show depth where mask is active
-        
-        # 4. Overlay: RGB with mask outline
-        overlay = rgb_bgr.copy()
-        overlay = cv2.addWeighted(overlay, 0.7, mask_colored, 0.3, 0)
+        overlay = cv2.addWeighted(rgb_bgr.copy(), 0.7, mask_colored, 0.3, 0)
         
         # Draw mask contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, tint, 2)
         
-        # Add distance text on overlay
+        # Add distance text
         if distance_m is not None:
-            text = f'Distance: {distance_m:.3f} m'
+            text = f'Dist: {distance_m:.3f}m'
             cv2.putText(overlay, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(overlay, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1)
         else:
-            cv2.putText(overlay, 'No valid depth', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(overlay, 'No depth', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
-        # 5. Create info panel
-        info_panel = np.zeros_like(rgb_bgr)
-        info_lines = [
-            f'Target Color: {self.target_color}',
-            f'Image Size: {w} x {h}',
-            f'Mask Pixels: {stats.get("mask_pixels", 0)}',
-            f'Valid Depth Pixels: {stats.get("valid_pixels", 0)}',
-        ]
-        if distance_m is not None:
-            info_lines.extend([
-                f'Distance: {distance_m:.4f} m',
-                f'Min Depth: {stats.get("min_depth", 0):.4f} m',
-                f'Max Depth: {stats.get("max_depth", 0):.4f} m',
-                f'Std Dev: {stats.get("std_depth", 0):.4f} m',
-            ])
-        else:
-            info_lines.append('Distance: NOT COMPUTED')
+        # Add stats
+        stats_text = f'Pixels: {stats.get("valid_pixels", 0)}'
+        cv2.putText(overlay, stats_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        for i, line in enumerate(info_lines):
-            cv2.putText(info_panel, line, (10, 25 + i * 28),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        # 4. Masked depth
+        masked_depth = depth_colored.copy()
+        masked_depth[mask == 0] = 0
         
-        # 6. Create combined visualization (2x3 grid)
-        # Row 1: RGB, Depth, Mask
-        # Row 2: Overlay, Masked Depth, Info
+        # 5. Create combined view: RGB | Depth | Mask | Overlay
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        row1 = np.hstack([rgb_bgr, depth_colored, mask_bgr])
-        row2 = np.hstack([overlay, masked_depth, info_panel])
-        combined = np.vstack([row1, row2])
+        combined = np.hstack([rgb_bgr, depth_colored, mask_bgr, overlay])
         
         # Add labels
         font = cv2.FONT_HERSHEY_SIMPLEX
-        label_y = 20
-        cv2.putText(combined, 'RGB', (10, label_y), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, 'Depth', (w + 10, label_y), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, 'Mask', (2*w + 10, label_y), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, 'Overlay', (10, h + label_y), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, 'Masked Depth', (w + 10, h + label_y), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, 'Info', (2*w + 10, h + label_y), font, 0.6, (255, 255, 255), 1)
-
-        # Show windows
-        cv2.imshow('Object Distance Debug', combined)
+        cv2.putText(combined, 'RGB', (10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Depth', (w + 10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Mask', (2*w + 10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, 'Overlay', (3*w + 10, 20), font, 0.5, (255, 255, 255), 1)
         
-        self.get_logger().info('Debug visualization displayed. Press any key to close.')
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        # Resize if too large
+        max_width = 1920
+        if combined.shape[1] > max_width:
+            scale = max_width / combined.shape[1]
+            combined = cv2.resize(combined, None, fx=scale, fy=scale)
+
+        cv2.imshow('Object Distance: RGB | Depth | Mask | Overlay', combined)
+        
+        if blocking:
+            self.get_logger().info('Visualization displayed. Press any key to close.')
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        else:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.get_logger().info('Quit key pressed, disabling visualization')
+                self.visualize = False
+                cv2.destroyAllWindows()
 
     def _depth_callback(self, msg: Image) -> None:
         if msg.encoding == "16UC1":
@@ -249,6 +245,7 @@ class ObjectDistanceNode(Node):
         try:
             rgb = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             self.latest_rgb = rgb
+            self.latest_rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             self.try_compute_distance()
         except Exception as e:
             self.get_logger().warn(f'Failed to convert RGB image: {e}')
@@ -275,14 +272,15 @@ class ObjectDistanceNode(Node):
                 return
             mask = color_mask(self.latest_rgb, self.target_color)
 
-        self.compute_distance(self.latest_depth, mask)
+        self.compute_distance(self.latest_depth, mask, rgb_bgr=self.latest_rgb_bgr)
 
-    def compute_distance(self, depth, mask, return_stats=False):
+    def compute_distance(self, depth, mask, rgb_bgr=None, return_stats=False):
         """Compute and publish average distance of masked pixels.
         
         Args:
             depth: Depth image (uint16 in mm or float32 in m)
             mask: Binary mask
+            rgb_bgr: Optional BGR image for visualization
             return_stats: If True, return (distance, stats_dict)
             
         Returns:
@@ -297,38 +295,38 @@ class ObjectDistanceNode(Node):
             'std_depth': 0,
         }
         
+        distance_m = None
+        
         if depth.shape[:2] != mask.shape[:2]:
             self.get_logger().warn(
                 f"Shape mismatch. Depth: {depth.shape}, Mask: {mask.shape}")
-            if return_stats:
-                return None, stats
-            return
+        else:
+            object_pixels = depth[mask > 0]
+            object_pixels = object_pixels[object_pixels > 0]
+            stats['valid_pixels'] = len(object_pixels)
 
-        object_pixels = depth[mask > 0]
-        object_pixels = object_pixels[object_pixels > 0]
-        stats['valid_pixels'] = len(object_pixels)
+            if object_pixels.size == 0:
+                self.get_logger().info("Object not in image (no valid depth pixels).")
+            else:
+                avg_depth_mm = np.mean(object_pixels)
+                distance_m = avg_depth_mm / 1000.0
+                
+                stats['min_depth'] = np.min(object_pixels) / 1000.0
+                stats['max_depth'] = np.max(object_pixels) / 1000.0
+                stats['std_depth'] = np.std(object_pixels) / 1000.0
 
-        if object_pixels.size == 0:
-            self.get_logger().info("Object not in image (no valid depth pixels).")
-            if return_stats:
-                return None, stats
-            return
+                msg = Float32()
+                msg.data = float(distance_m)
+                self.distance_pub.publish(msg)
 
-        avg_depth_mm = np.mean(object_pixels)
-        avg_depth_m = avg_depth_mm / 1000.0
+                self.get_logger().info(f"Object distance: {distance_m:.3f} m ({len(object_pixels)} pixels)")
         
-        stats['min_depth'] = np.min(object_pixels) / 1000.0
-        stats['max_depth'] = np.max(object_pixels) / 1000.0
-        stats['std_depth'] = np.std(object_pixels) / 1000.0
-
-        msg = Float32()
-        msg.data = float(avg_depth_m)
-        self.distance_pub.publish(msg)
-
-        self.get_logger().info(f"Object distance: {avg_depth_m:.3f} m ({len(object_pixels)} pixels)")
+        # Live visualization (non-blocking)
+        if self.visualize and rgb_bgr is not None:
+            self.visualize_frame(rgb_bgr, depth, mask, distance_m, stats, blocking=False)
         
         if return_stats:
-            return avg_depth_m, stats
+            return distance_m, stats
 
 
 def main() -> None:
@@ -337,9 +335,14 @@ def main() -> None:
 
     rclpy.init()
     node = ObjectDistanceNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cv2.destroyAllWindows()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
