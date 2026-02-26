@@ -92,10 +92,19 @@ class GripperController:
                 JointSingleCommand, '/left_arm/commands/joint_single', 10
             )
 
-        # Subscribe to /joint_states for grasp detection
+        # Subscribe to joint states for grasp detection.
+        # On real hardware the per-arm topics (/right_arm/joint_states,
+        # /left_arm/joint_states) are the primary source; the aggregated
+        # /joint_states topic is also subscribed as a fallback (sim uses it).
         self.finger_positions = {}
         self.joint_state_sub = node.create_subscription(
             JointState, '/joint_states', self._joint_state_callback, 10
+        )
+        self.right_arm_js_sub = node.create_subscription(
+            JointState, '/right_arm/joint_states', self._joint_state_callback, 10
+        )
+        self.left_arm_js_sub = node.create_subscription(
+            JointState, '/left_arm/joint_states', self._joint_state_callback, 10
         )
 
         self.node.get_logger().debug(f'GripperController initialized (mode={mode})')
@@ -248,8 +257,13 @@ class GripperController:
             return False
 
         # Spin briefly to ensure we have fresh joint state data
-        for _ in range(10):
-            rclpy.spin_once(self.node, timeout_sec=0.01)
+        for _ in range(20):
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+
+        # Debug: show all stored finger positions
+        self.node.get_logger().info(
+            f'check_grasp({side}): finger_positions={self.finger_positions}'
+        )
 
         # Read actual finger positions
         positions = []
@@ -275,7 +289,7 @@ class GripperController:
         )
         return grasped
 
-    def close_and_check(self, side: str, duration: float = 2.0,
+    def close_and_check(self, side: str, duration: float = 5.0,
                         threshold: float = 0.003) -> bool:
         """
         Close the gripper and check if an object was grasped.

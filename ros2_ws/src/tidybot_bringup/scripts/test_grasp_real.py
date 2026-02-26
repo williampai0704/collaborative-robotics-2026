@@ -97,39 +97,39 @@ class TestGraspReal(Node):
         # --- Step 1: Open all connected grippers ---
         self.get_logger().info('[Step 1/4] Opening grippers...')
         if len(sides) == 2:
-            self.gripper.open_both(duration=2.5)
+            self.gripper.open_both(duration=5.0)
         else:
-            self.gripper.open(sides[0], duration=2.5)
+            self.gripper.open(sides[0], duration=5.0)
         input('\n>>> Grippers should be OPEN. Press Enter to continue...\n')
 
         # --- Step 2: Close grippers (empty) and check grasp ---
         self.get_logger().info('[Step 2/4] Closing grippers (empty — no object)...')
         for side in sides:
-            grasped = self.gripper.close_and_check(side, duration=2.5)
+            grasped = self.gripper.close_and_check(side, duration=5.0)
             self.get_logger().info(f'  {side}: grasped={grasped}  (expected: False)')
         input('\n>>> Grippers should be CLOSED with nothing held. Press Enter to continue...\n')
 
         # --- Step 3: Open grippers, let user place an object ---
         self.get_logger().info('[Step 3/4] Opening grippers — place an object between the fingers...')
         if len(sides) == 2:
-            self.gripper.open_both(duration=2.5)
+            self.gripper.open_both(duration=5.0)
         else:
-            self.gripper.open(sides[0], duration=2.5)
+            self.gripper.open(sides[0], duration=5.0)
         input('\n>>> Place an object between the gripper fingers, then press Enter to CLOSE...\n')
 
         # --- Step 4: Close grippers on the object and check grasp ---
         self.get_logger().info('[Step 4/4] Closing grippers on object...')
         for side in sides:
-            grasped = self.gripper.close_and_check(side, duration=2.5)
+            grasped = self.gripper.close_and_check(side, duration=5.0)
             self.get_logger().info(f'  {side}: grasped={grasped}  (expected: True)')
 
         # Final open
         self.get_logger().info('')
         self.get_logger().info('Opening grippers to release...')
         if len(sides) == 2:
-            self.gripper.open_both(duration=2.5)
+            self.gripper.open_both(duration=5.0)
         else:
-            self.gripper.open(sides[0], duration=2.5)
+            self.gripper.open(sides[0], duration=5.0)
 
         self.get_logger().info('')
         self.get_logger().info('Grasp test complete!')
