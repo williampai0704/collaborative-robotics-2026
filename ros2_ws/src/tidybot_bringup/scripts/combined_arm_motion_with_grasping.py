@@ -90,7 +90,7 @@ class Combined_Arm_Gripper_Controller(Node):
                 response.success = False
                 response.message = "Hover motion planner service timeout."
                 return response
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         hover_response = hover_future.result()
 
@@ -122,7 +122,7 @@ class Combined_Arm_Gripper_Controller(Node):
                 response.success = False
                 response.message = "Final reach motion planner service timeout."
                 return response
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         plan_response = reach_future.result()
 
@@ -180,7 +180,7 @@ class Combined_Arm_Gripper_Controller(Node):
                     response.success = False
                     response.message = "Lift motion planner service timeout."
                     return response
-                time.sleep(0.05)
+                time.sleep(0.1)
                 
             lift_response = lift_future.result()
             

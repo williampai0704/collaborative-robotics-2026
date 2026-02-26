@@ -98,4 +98,7 @@ echo "  uv packages available via PYTHONPATH"
 echo ""
 
 # added by JJ on 2024-06-30: Set TIDYBOT_SIMULATION_PATH for motion planner to find MuJoCo model
-export TIDYBOT_SIMULATION_PATH="/home/jj/collaborative-robotics-2026/simulation"
+export TIDYBOT_SIMULATION_PATH="$(cd "$SCRIPT_DIR/../simulation" && pwd)"
+echo "✓ Set TIDYBOT_SIMULATION_PATH=$TIDYBOT_SIMULATION_PATH"
+
+
