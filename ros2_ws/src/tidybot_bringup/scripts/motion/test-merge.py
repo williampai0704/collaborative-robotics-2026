@@ -3,15 +3,17 @@
 Control TidyBot to move in a straight line or spin in place based on commands.
 
 Topics:
-- Publishes: /cmd_vel (geometry_msgs/Twist)
+- Publishes:  /cmd_vel (geometry_msgs/Twist)
 - Subscribes: /odom (nav_msgs/Odometry)
-- Subscribes: /motion_command (std_msgs/String)  values: "linear" or "search"
-- Subscribes: /stop_motion (std_msgs/Bool)       value: true to stop
+- Subscribes: /motion_command (std_msgs/String)
+        args: "linear" or "search"
+- Subscribes: /stop_motion (std_msgs/Bool)
+        arg:  "true" to stop
 
 Usage examples:
-  ros2 topic pub /motion_command std_msgs/msg/String "{data: 'linear'}" --once
-  ros2 topic pub /motion_command std_msgs/msg/String "{data: 'search'}" --once
-  ros2 topic pub /stop_motion std_msgs/msg/Bool "{data: true}" --once
+    ros2 topic pub /motion_command std_msgs/msg/String "{data: 'linear'}" --once
+    ros2 topic pub /motion_command std_msgs/msg/String "{data: 'search'}" --once
+    ros2 topic pub /stop_motion std_msgs/msg/Bool "{data: true}" --once
 """
 
 import rclpy
