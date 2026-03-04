@@ -45,6 +45,9 @@ install(PROGRAMS
   scripts/vision/testing/test_camera_smoke.py
   scripts/vision/testing/test_capture_dataset.py
   scripts/vision/testing/test_pan_tilt_sweep.py
+  scripts/motion/test-linear.py
+  scripts/motion/test-spinning.py
+  scripts/motion/test-merge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
