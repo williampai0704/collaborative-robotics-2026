@@ -1,0 +1,14 @@
+# Goal (사용자가 입력할 목표)
+string arm_name
+float64 target_x
+float64 target_y
+float64 target_z
+float64 duration
+---
+# Result (최종 결과)
+bool success
+string message
+---
+# Feedback (실시간 진행 상황)
+string current_phase
+float64 time_remaining
