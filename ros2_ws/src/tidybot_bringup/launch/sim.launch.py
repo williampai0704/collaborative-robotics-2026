@@ -129,7 +129,7 @@ def launch_setup(context, *args, **kwargs):
     # [추가된 부분!] 시뮬레이션 시작 3초 후 로봇 양팔을 안전한 자세로 전개
     # ==========================================================
     # 관절 각도(라디안): [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
-    initial_pose = "[0.0, -0.8, 0.8, 0.0, 0.0, 0.0]"
+    initial_pose = "[0.0, -0.5, 0.5, 0.0, 0.0, 0.0]"
 
     right_init = TimerAction(
         period=3.0,  # 시뮬레이션은 금방 켜지므로 3초 대기

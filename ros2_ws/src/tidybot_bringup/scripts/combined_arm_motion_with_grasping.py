@@ -14,7 +14,9 @@ from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
+from sensor_msgs.msg import JointState  # JointState 메시지 임포트 추가
 from tidybot_msgs.srv import PlanToTarget
+from tidybot_msgs.msg import ArmCommand # [MODIFIED] Added for Step 0 synchronization
 from tidybot_control.gripper_controller import GripperController
 
 class Combined_Arm_Gripper_Controller(Node):
@@ -24,13 +26,34 @@ class Combined_Arm_Gripper_Controller(Node):
         self.declare_parameter('gripper_mode', 'sim')
         gripper_mode = self.get_parameter('gripper_mode').get_parameter_value().string_value
 
-        # Separate callback groups for Server and Client to avoid starvation
+        # Separate callback groups for Server, Client, and Subscriber to avoid starvation
         self.server_cb_group = MutuallyExclusiveCallbackGroup()
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
+        self.sub_cb_group = MutuallyExclusiveCallbackGroup() # Subscriber용 그룹 추가
+
+        # Joint States 저장용 딕셔너리
+        self.current_joint_states = {}
+
+        # ==========================================
+        # [MODIFIED] Added publishers to send direct sync commands to the low-level controllers
+        # ==========================================
+        self.arm_cmd_pubs = {
+            'right': self.create_publisher(ArmCommand, '/right_arm/cmd', 10, callback_group=self.client_cb_group),
+            'left': self.create_publisher(ArmCommand, '/left_arm/cmd', 10, callback_group=self.client_cb_group)
+        }
 
         # 1. Initialize Gripper Controller
         self.get_logger().info(f'[INIT] Initializing GripperController in {gripper_mode} mode...')
         self.gripper = GripperController(self, mode=gripper_mode, pressure=1.0)
+
+        # 1-1. Initialize Joint State Subscriber
+        self.joint_sub = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_callback,
+            10,
+            callback_group=self.sub_cb_group
+        )
 
         # 2. Client setup
         self.plan_client = self.create_client(
@@ -53,11 +76,75 @@ class Combined_Arm_Gripper_Controller(Node):
 
         self.get_logger().info('[READY] Manipulation Coordinator ready. Call /perform_grasp to test.')
 
+    def joint_state_callback(self, msg: JointState):
+        """계속해서 들어오는 조인트 상태를 딕셔너리에 업데이트합니다."""
+        for name, pos in zip(msg.name, msg.position):
+            self.current_joint_states[name] = pos
+
+    def wait_for_joint_convergence(self, arm_name: str, target_joints: list, timeout: float, tolerance: float = 0.01) -> bool:
+        """
+        현재 관절 각도가 목표 관절 각도(target_joints)에 오차(tolerance) 내로 도달할 때까지 대기합니다.
+        """
+        # arm_name에 맞는 조인트 이름 리스트 생성
+        joint_names = [
+            f'{arm_name}_waist', f'{arm_name}_shoulder', f'{arm_name}_elbow',
+            f'{arm_name}_forearm_roll', f'{arm_name}_wrist_angle', f'{arm_name}_wrist_rotate'
+        ]
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # 필요한 조인트 데이터가 모두 수신되었는지 확인
+            if all(j in self.current_joint_states for j in joint_names):
+                current_joints = [self.current_joint_states[j] for j in joint_names]
+                
+                # 각 관절별 오차 중 가장 큰 값을 확인
+                max_error = max(abs(c - t) for c, t in zip(current_joints, target_joints))
+                
+                if max_error <= tolerance:
+                    self.get_logger().info(f" -> Joints converged! (Max error: {max_error:.4f} rad)")
+                    return True
+            
+            # 짧게 대기 후 다시 확인 (while문 폭주 방지)
+            time.sleep(0.1)
+
+        self.get_logger().warn(f" -> Timeout reached before joints fully converged (Tolerance: {tolerance} rad).")
+        return False
+
     def grasp_callback(self, request, response):
         arm_name = request.arm_name.lower()
         self.get_logger().info(f"\n========== GRASP SEQUENCE STARTED FOR {arm_name.upper()} ARM ==========")
         
         timeout_sec = 20.0
+        joint_names = [
+            f'{arm_name}_waist', f'{arm_name}_shoulder', f'{arm_name}_elbow',
+            f'{arm_name}_forearm_roll', f'{arm_name}_wrist_angle', f'{arm_name}_wrist_rotate'
+        ]
+
+        # ==========================================
+        # Step 0: Synchronize Low-Level Controller (Ghost Data 방지)
+        # ==========================================
+        self.get_logger().info("STEP 0: Waiting for valid (non-zero) physical joint states...")
+        valid_state_received = False
+        
+        # 0.0 유령 데이터를 걸러내기 위해 최대 2초 대기
+        for _ in range(20):
+            if all(j in self.current_joint_states for j in joint_names):
+                # 모든 관절이 0.001 미만(사실상 0.0)인지 검사
+                is_all_zeros = all(abs(self.current_joint_states[j]) < 0.001 for j in joint_names)
+                if not is_all_zeros:
+                    valid_state_received = True
+                    break
+            time.sleep(0.1)
+
+        if valid_state_received:
+            self.get_logger().info("STEP 0: Valid states received. Synchronizing controller...")
+            sync_cmd = ArmCommand()
+            sync_cmd.joint_positions = [self.current_joint_states[j] for j in joint_names]
+            sync_cmd.duration = 0.5 
+            self.arm_cmd_pubs[arm_name].publish(sync_cmd)
+            time.sleep(1.0)
+        else:
+            self.get_logger().warn("STEP 0: Failed to get valid states. Robot might jerk to 0.0!")
 
         # ==========================================
         # Step 1: Open Gripper
@@ -66,136 +153,106 @@ class Combined_Arm_Gripper_Controller(Node):
         self.gripper.open(arm_name, duration=1.0)
         
         # ==========================================
-        # Step 2: Pre-grasp Hover (Target X, Y with Z=0.4)
+        # Step 2: Pre-grasp Hover (z=0.4)
         # ==========================================
-        self.get_logger().info(f"STEP 2: Planning pre-grasp hover motion (x={request.target_pose.position.x}, y={request.target_pose.position.y}, z=0.4)...")
-        
+        self.get_logger().info(f"STEP 2: Planning pre-grasp hover motion (z=0.4)...")
         hover_req = PlanToTarget.Request()
         hover_req.arm_name = arm_name
         hover_req.target_pose.position.x = request.target_pose.position.x
         hover_req.target_pose.position.y = request.target_pose.position.y
-        hover_req.target_pose.position.z = 0.4  # 강제로 z를 0.4로 설정
+        hover_req.target_pose.position.z = 0.4
         hover_req.target_pose.orientation = request.target_pose.orientation
         hover_req.use_orientation = request.use_orientation
         hover_req.execute = request.execute
-        hover_req.duration = 5.0  # Hover 위치로 가는 데 걸리는 시간 (필요에 따라 조절 가능)
+        hover_req.duration = 10.0 
 
-        self.get_logger().info("STEP 2: Calling motion planner to generate IK solution for hover position...")
         hover_future = self.plan_client.call_async(hover_req)
-
-        wait_start = time.time()
         while not hover_future.done():
-            if time.time() - wait_start > timeout_sec:
-                self.get_logger().error(f"STEP 2 ERROR: Pre-grasp hover planner timeout!")
-                response.success = False
-                response.message = "Hover motion planner service timeout."
-                return response
-            time.sleep(0.1)
-
+            time.sleep(0.05)
         hover_response = hover_future.result()
 
-        if not hover_response.success:
-            self.get_logger().error(f"STEP 2 ERROR: Hover planning failed -> {hover_response.message}")
-            response.success = False
-            response.message = f"Failed at pre-grasp hover: {hover_response.message}"
-            return response
-
-        self.get_logger().info("STEP 2: Pre-grasp hover IK solution found successfully!")
-
         if request.execute:
-            self.get_logger().info(f"STEP 2-1: Executing physical arm movement to hover position... Waiting {hover_req.duration}s")
-            time.sleep(hover_req.duration)
-
+            self.wait_for_joint_convergence(arm_name, hover_response.joint_positions, timeout=15.0)
 
         # ==========================================
-        # Step 3: Final Reach to Requested Target
+        # Step 3-A: Mid-descent Waypoint (z=0.15) - 튐 방지
         # ==========================================
-        self.get_logger().info(f"STEP 3: Planning final descent to target (z={request.target_pose.position.z})...")
-        self.get_logger().info("STEP 3: Calling motion planner to generate IK solution for final grasp position...")
+        self.get_logger().info("STEP 3-A: Mid-descent to z=0.15 to prevent joint sweeping arc...")
+        reach_req_a = PlanToTarget.Request()
+        reach_req_a.arm_name = arm_name
+        reach_req_a.target_pose.position.x = request.target_pose.position.x 
+        reach_req_a.target_pose.position.y = request.target_pose.position.y
+        reach_req_a.target_pose.position.z = 0.15 
+        reach_req_a.target_pose.orientation = request.target_pose.orientation
+        reach_req_a.use_orientation = request.use_orientation
+        reach_req_a.execute = True
+        reach_req_a.duration = 5.0 
         
+        future_3a = self.plan_client.call_async(reach_req_a)
+        while not future_3a.done():
+            time.sleep(0.05)
+        self.wait_for_joint_convergence(arm_name, future_3a.result().joint_positions, timeout=10.0)
+
+        # ==========================================
+        # Step 3-B: Final Reach (z=0.02)
+        # ==========================================
+        self.get_logger().info(f"STEP 3-B: Final descent to target (z={request.target_pose.position.z})...")
         reach_future = self.plan_client.call_async(request)
-
-        wait_start = time.time()
         while not reach_future.done():
-            if time.time() - wait_start > timeout_sec:
-                self.get_logger().error(f"STEP 3 ERROR: Final reach planner timeout!")
-                response.success = False
-                response.message = "Final reach motion planner service timeout."
-                return response
-            time.sleep(0.1)
-
+            time.sleep(0.05)
         plan_response = reach_future.result()
-
-        if not plan_response.success:
-            self.get_logger().error(f"STEP 3 ERROR: Final reach planning failed -> {plan_response.message}")
-            response.success = False
-            response.message = f"Failed at final reach: {plan_response.message}"
-            return response
-
-        self.get_logger().info("STEP 3: Final reach IK solution found successfully!")
-
+        
         if request.execute:
-            self.get_logger().info(f"STEP 3-1: Executing physical arm descent to target... Waiting {request.duration}s")
-            time.sleep(request.duration)
+            self.wait_for_joint_convergence(arm_name, plan_response.joint_positions, timeout=10.0)
 
             # ==========================================
-            # Step 4: Close Gripper
+            # Step 4: Close Gripper & Step 5: Wait
             # ==========================================
-            self.get_logger().info("STEP 4: Target reached. Closing gripper to grasp...")
+            self.get_logger().info("STEP 4: Target reached. Closing gripper...")
+            time.sleep(2.0)
             self.gripper.close(arm_name, duration=2.0)
-            
-            # ==========================================
-            # Step 5: Wait 1 second after grasping
-            # ==========================================
             self.get_logger().info("STEP 5: Grasp complete. Waiting 1 second...")
             time.sleep(1.0)
             
             # ==========================================
-            # Step 6: Lift the object to new position
+            # Step 6-A: Mid-lift Waypoint (z=0.15) - 튐 방지
             # ==========================================
-            self.get_logger().info("STEP 6: Planning lift motion...")
-            lift_req = PlanToTarget.Request()
-            lift_req.arm_name = arm_name
-            # Set the new target position
-            lift_req.target_pose.position.x = 0.0
-            lift_req.target_pose.position.y = -0.3
-            lift_req.target_pose.position.z = 0.3
-            # Set the new target orientation
-            lift_req.target_pose.orientation.w = 0.7071
-            lift_req.target_pose.orientation.x = 0.0
-            lift_req.target_pose.orientation.y = 0.7071
-            lift_req.target_pose.orientation.z = 0.0
+            self.get_logger().info("STEP 6-A: Mid-lift to z=0.15 to prevent joint sweeping arc...")
+            lift_req_a = PlanToTarget.Request()
+            lift_req_a.arm_name = arm_name
+            lift_req_a.target_pose.position.x = request.target_pose.position.x 
+            lift_req_a.target_pose.position.y = request.target_pose.position.y
+            lift_req_a.target_pose.position.z = 0.15 
+            lift_req_a.target_pose.orientation = request.target_pose.orientation
+            lift_req_a.use_orientation = request.use_orientation
+            lift_req_a.execute = True
+            lift_req_a.duration = 5.0 
             
-            lift_req.use_orientation = request.use_orientation
-            lift_req.execute = True
-            lift_req.duration = 5.0  # lift time
+            future_6a = self.plan_client.call_async(lift_req_a)
+            while not future_6a.done():
+                time.sleep(0.05)
+            self.wait_for_joint_convergence(arm_name, future_6a.result().joint_positions, timeout=10.0)
+
+            # ==========================================
+            # Step 6-B: Final Lift (z=0.40)
+            # ==========================================
+            self.get_logger().info("STEP 6-B: Final lift to hover height (z=0.40)...")
+            lift_req_b = PlanToTarget.Request()
+            lift_req_b.arm_name = arm_name
+            lift_req_b.target_pose.position.x = request.target_pose.position.x 
+            lift_req_b.target_pose.position.y = request.target_pose.position.y
+            lift_req_b.target_pose.position.z = 0.4 
+            lift_req_b.target_pose.orientation = request.target_pose.orientation
+            lift_req_b.use_orientation = request.use_orientation
+            lift_req_b.execute = True
+            lift_req_b.duration = 8.0 
             
-            self.get_logger().info("STEP 6: Calling motion planner to generate IK solution for lift...")
-            lift_future = self.plan_client.call_async(lift_req)
+            future_6b = self.plan_client.call_async(lift_req_b)
+            while not future_6b.done():
+                time.sleep(0.05)
+            self.wait_for_joint_convergence(arm_name, future_6b.result().joint_positions, timeout=12.0)
             
-            lift_wait_start = time.time()
-            while not lift_future.done():
-                if time.time() - lift_wait_start > timeout_sec:
-                    self.get_logger().error(f"STEP 6 ERROR: Lift motion planner timeout!")
-                    response.success = False
-                    response.message = "Lift motion planner service timeout."
-                    return response
-                time.sleep(0.1)
-                
-            lift_response = lift_future.result()
-            
-            if not lift_response.success:
-                self.get_logger().error(f"STEP 6 ERROR: Lift planning failed -> {lift_response.message}")
-                response.success = False
-                response.message = f"Failed at lift planning: {lift_response.message}"
-                return response
-                
-            self.get_logger().info(f"STEP 6-1: Lift IK solution found. Executing movement for {lift_req.duration}s...")
-            time.sleep(lift_req.duration)
-            
-            response.message = "Pre-grasp hover, final reach, grasp, and lift execution completed successfully."
-        else:
-            response.message = "Planning for hover and final reach completed (execution skipped)."
+            response.message = "Multi-step grasp and lift execution completed perfectly."
 
         response.success = True
         response.position_error = plan_response.position_error

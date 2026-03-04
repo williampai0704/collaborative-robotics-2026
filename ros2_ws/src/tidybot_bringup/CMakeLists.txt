@@ -39,6 +39,7 @@ install(PROGRAMS
   scripts/trajectory_tracking.py
   scripts/combined_arm_motion_with_grasping.py
   scripts/combined_arm_motion_with_grasping_real.py
+  scripts/ee_trajectory_plotter.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
