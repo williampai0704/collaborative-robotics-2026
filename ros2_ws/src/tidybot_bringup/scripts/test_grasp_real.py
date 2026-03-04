@@ -44,25 +44,40 @@ class TestGraspReal(Node):
         self.right_connected = False
         self.left_connected = False
 
-        self.right_joint_sub = self.create_subscription(
-            JointState, '/right_arm/joint_states', self._right_cb, 10
-        )
-        self.left_joint_sub = self.create_subscription(
-            JointState, '/left_arm/joint_states', self._left_cb, 10
+        # self.right_joint_sub = self.create_subscription(
+        #     JointState, '/right_arm/joint_states', self._right_cb, 10
+        # )
+        # self.left_joint_sub = self.create_subscription(
+        #     JointState, '/left_arm/joint_states', self._left_cb, 10
+        # )
+
+        # Use aggregated /joint_states instead of per-arm topics
+        self.joint_state_sub = self.create_subscription(
+            JointState, '/joint_states', self._joint_state_cb, 10
         )
 
         self.get_logger().info(f'GripperController mode={mode}, pressure={pressure}')
         self.get_logger().info('Waiting for joint states...')
 
-    def _right_cb(self, msg):
-        if not self.right_connected:
-            self.right_connected = True
-            self.get_logger().info('Connected to right_arm!')
+    # def _right_cb(self, msg):
+    #     if not self.right_connected:
+    #         self.right_connected = True
+    #         self.get_logger().info('Connected to right_arm!')
 
-    def _left_cb(self, msg):
-        if not self.left_connected:
-            self.left_connected = True
-            self.get_logger().info('Connected to left_arm!')
+    # def _left_cb(self, msg):
+    #     if not self.left_connected:
+    #         self.left_connected = True
+    #         self.get_logger().info('Connected to left_arm!')
+
+    def _joint_state_cb(self, msg):
+        if 'right_left_finger' in msg.name:
+            if not self.right_connected:
+                self.right_connected = True
+                self.get_logger().info('Connected to right gripper!')
+        if 'left_left_finger' in msg.name:
+            if not self.left_connected:
+                self.left_connected = True
+                self.get_logger().info('Connected to left gripper!')
 
     def wait_for_connection(self, timeout=5.0):
         """Wait for at least one arm to be connected."""

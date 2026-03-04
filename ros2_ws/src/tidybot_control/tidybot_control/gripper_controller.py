@@ -39,9 +39,13 @@ from interbotix_xs_msgs.msg import JointSingleCommand
 GRIPPER_PRESSURE_LOWER = 150   # Minimum PWM for movement
 GRIPPER_PRESSURE_UPPER = 350   # Maximum PWM (avoid motor overload)
 
-# Finger position limits (meters, from MuJoCo bridge)
-FINGER_OPEN_POS = 0.037    # Fully open finger position
-FINGER_CLOSED_POS = 0.015  # Fully closed finger position
+# Finger position limits (meters) — differ between sim and real hardware
+# Sim (mujoco_bridge):   0.037 (open) → 0.015 (closed)
+# Real (dynamixel_bus):  0.022 (open) → -0.014 (closed)
+FINGER_LIMITS = {
+    'sim': {'open': 0.037, 'closed': 0.015},
+    'sdk': {'open': 0.022, 'closed': -0.014},
+}
 
 # Finger joint names per side
 FINGER_JOINT_NAMES = {
@@ -92,20 +96,17 @@ class GripperController:
                 JointSingleCommand, '/left_arm/commands/joint_single', 10
             )
 
-        # Subscribe to joint states for grasp detection.
-        # On real hardware the per-arm topics (/right_arm/joint_states,
-        # /left_arm/joint_states) are the primary source; the aggregated
-        # /joint_states topic is also subscribed as a fallback (sim uses it).
+        # Subscribe to aggregated /joint_states for grasp detection.
+        # Works for both sim (mujoco_bridge) and real hardware (joint_state_aggregator).
         self.finger_positions = {}
         self.joint_state_sub = node.create_subscription(
             JointState, '/joint_states', self._joint_state_callback, 10
         )
-        self.right_arm_js_sub = node.create_subscription(
-            JointState, '/right_arm/joint_states', self._joint_state_callback, 10
-        )
-        self.left_arm_js_sub = node.create_subscription(
-            JointState, '/left_arm/joint_states', self._joint_state_callback, 10
-        )
+
+        # Select finger position limits based on mode
+        limits = FINGER_LIMITS.get(mode, FINGER_LIMITS['sim'])
+        self.finger_open_pos = limits['open']
+        self.finger_closed_pos = limits['closed']
 
         self.node.get_logger().debug(f'GripperController initialized (mode={mode})')
 
@@ -280,11 +281,11 @@ class GripperController:
         avg_pos = sum(positions) / len(positions)
 
         # If fingers stopped above (closed + threshold), something is between them
-        grasped = avg_pos > (FINGER_CLOSED_POS + threshold)
+        grasped = avg_pos > (self.finger_closed_pos + threshold)
 
         self.node.get_logger().info(
             f'Grasp check ({side}): finger_pos={avg_pos:.4f}m, '
-            f'closed={FINGER_CLOSED_POS}m, threshold={threshold}m, '
+            f'closed={self.finger_closed_pos}m, threshold={threshold}m, '
             f'grasped={grasped}'
         )
         return grasped
