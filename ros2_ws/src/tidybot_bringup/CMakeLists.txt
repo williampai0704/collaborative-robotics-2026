@@ -37,6 +37,8 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  scripts/task_1.py
+  scripts/task_2.py
   # Vision scripts
   scripts/vision/find_center.py
   scripts/vision/color_mask.py

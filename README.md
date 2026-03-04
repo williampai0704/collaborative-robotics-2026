@@ -185,3 +185,6 @@ cd ros2_ws && colcon build
 ## Authors
 
 Alex Qiu & Matt Strong - Stanford ARM Lab
+
+
+Put credential under ros2_ws/src/tidybot_bringup/config/credentials/ as google_cloud_key.json
