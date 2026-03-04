@@ -1,3 +1,7 @@
+# outputs
+ros2_ws/src/tidybot_bringup/scripts/vision/output/
+
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,0 +1,72 @@
+{
+  "index": 16,
+  "wall_time_s": 1772149639.8040483,
+  "rgb_stamp": {
+    "sec": 1772149639,
+    "nanosec": 658858398
+  },
+  "depth_stamp": {
+    "sec": 1772149639,
+    "nanosec": 448389893
+  },
+  "rgb_frame_id": "camera_color_optical_frame",
+  "depth_frame_id": "camera_depth_optical_frame",
+  "rgb_encoding": "rgb8",
+  "depth_encoding": "16UC1",
+  "rgb_size": {
+    "width": 640,
+    "height": 480
+  },
+  "depth_size": {
+    "width": 640,
+    "height": 480
+  },
+  "pan_tilt_state": {
+    "pan": 0.0,
+    "tilt": 0.6166602969169617
+  },
+  "depth_age_ms": 297.482967376709,
+  "depth_invalid_ratio": 0.13007812500000004,
+  "color_camera_info": {
+    "k": [
+      609.7716674804688,
+      0.0,
+      331.6385192871094,
+      0.0,
+      610.3194580078125,
+      247.25904846191406,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "d": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "distortion_model": "plumb_bob"
+  },
+  "depth_camera_info": {
+    "k": [
+      380.4629821777344,
+      0.0,
+      324.5294494628906,
+      0.0,
+      380.4629821777344,
+      241.70526123046875,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "d": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "distortion_model": "plumb_bob"
+  }
+}
