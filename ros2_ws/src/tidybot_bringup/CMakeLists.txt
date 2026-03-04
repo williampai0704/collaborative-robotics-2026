@@ -40,6 +40,19 @@ install(PROGRAMS
   scripts/combined_arm_motion_with_grasping.py
   scripts/combined_arm_motion_with_grasping_real.py
   scripts/ee_trajectory_plotter.py
+  scripts/task_1.py
+  scripts/task_2.py
+  # Vision scripts
+  scripts/vision/find_center.py
+  scripts/vision/color_mask.py
+  scripts/vision/obj_dist.py
+  scripts/vision/simple_pose_fit.py
+  scripts/vision/testing/test_camera_smoke.py
+  scripts/vision/testing/test_capture_dataset.py
+  scripts/vision/testing/test_pan_tilt_sweep.py
+  scripts/motion/test-linear.py
+  scripts/motion/test-spinning.py
+  scripts/motion/test-merge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
