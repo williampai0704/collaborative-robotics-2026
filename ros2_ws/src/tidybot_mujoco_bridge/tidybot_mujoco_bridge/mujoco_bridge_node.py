@@ -22,6 +22,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import JointState, Image, CameraInfo
 from geometry_msgs.msg import Twist, TransformStamped, Pose2D
+from geometry_msgs.msg import Pose
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64MultiArray, Header, Bool
 from tf2_ros import TransformBroadcaster
@@ -244,6 +245,10 @@ class MuJoCoBridgeNode(Node):
             Pose2D, '/base/target_pose', self.target_pose_callback, 10
         )
 
+        self.marker_sub = self.create_subscription(
+            Pose, '/target_marker_pose', self.marker_callback, 10
+        )
+
         # Timers
         sim_period = 1.0 / self.sim_rate
         self.sim_timer = self.create_timer(sim_period, self.sim_step_callback)
@@ -264,6 +269,19 @@ class MuJoCoBridgeNode(Node):
         self.get_logger().info(f'  Sim rate: {self.sim_rate} Hz')
         self.get_logger().info(f'  Publish rate: {self.publish_rate} Hz')
         self.get_logger().info(f'  Camera rate: {self.camera_rate} Hz')
+
+    def marker_callback(self, msg: Pose):
+        mocap_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "target_marker")
+        if mocap_id == -1:
+            self.get_logger().warn("target_marker body not found in XML!")
+            return
+            
+        mocap_mocapid = self.model.body_mocapid[mocap_id]
+        
+
+        self.data.mocap_pos[mocap_mocapid][0] = msg.position.x
+        self.data.mocap_pos[mocap_mocapid][1] = msg.position.y
+        self.data.mocap_pos[mocap_mocapid][2] = msg.position.z
 
     def run_viewer(self):
         """Run MuJoCo viewer in a separate thread."""

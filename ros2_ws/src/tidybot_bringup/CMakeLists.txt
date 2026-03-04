@@ -37,6 +37,9 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  scripts/combined_arm_motion_with_grasping.py
+  scripts/combined_arm_motion_with_grasping_real.py
+  scripts/ee_trajectory_plotter.py
   scripts/task_1.py
   scripts/task_2.py
   # Vision scripts
@@ -51,6 +54,12 @@ install(PROGRAMS
   scripts/motion/test-spinning.py
   scripts/motion/test-merge.py
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/combined_arm_motion_with_grasping.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME combined_arm_gripper_controller
 )
 
 ament_package()
