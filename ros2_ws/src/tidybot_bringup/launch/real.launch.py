@@ -374,7 +374,7 @@ def generate_launch_description():
             description='Launch microphone recording node'
         ),
         DeclareLaunchArgument(
-            'use_planner', default_value='false',
+            'use_planner', default_value='true',
             description='Launch IK motion planner for real hardware'
         ),
         DeclareLaunchArgument(

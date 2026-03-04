@@ -13,6 +13,7 @@ Services:
 import numpy as np
 from pathlib import Path
 from threading import Lock
+import threading  # [MODIFIED] Added threading module to prevent ROS 2 executor blocking
 import subprocess
 import time
 from ament_index_python.packages import get_package_share_directory
@@ -494,8 +495,15 @@ class MotionPlannerRealNode(Node):
         
         # Dispatch hardware commands if requested
         if request.execute:
-            self.execute_trajectory(arm_name, solution, request.duration)
+            # [MODIFIED] Spawning a background thread to prevent ROS 2 executor blocking during time.sleep()
+            exec_thread = threading.Thread(
+                target=self.execute_trajectory,
+                args=(arm_name, solution, request.duration),
+                daemon=True
+            )
+            exec_thread.start()
             response.executed = True
+            self.get_logger().info(f'Started executing motion over {request.duration}s in background thread.')
         else:
             response.executed = False
 
@@ -515,10 +523,13 @@ class MotionPlannerRealNode(Node):
             q = start + alpha * (target - start)
 
             cmd = JointGroupCommand()
-            cmd.name = f'{arm_name}_arm'
+            # [KEPT ORIGINAL] Retained your original custom namespace structure for the real hardware
+            cmd.name = f'{arm_name}_arm'  
             cmd.cmd = q.tolist()
             self.arm_cmd_pubs[arm_name].publish(cmd)
-            if i < num_steps: time.sleep(dt)
+            
+            if i < num_steps: 
+                time.sleep(dt)
 
     def publish_workspace_marker(self):
         """Publishes an RViz marker to visually display the safe workspace bounding box."""
@@ -550,8 +561,12 @@ class MotionPlannerRealNode(Node):
             ee_pos = self.data.oMf[ee_frame_id].translation.copy()
             if not self.is_in_workspace(ee_pos):
                 self.get_logger().warn(f'{arm.capitalize()} end-effector out of workspace: {ee_pos}')
-        try: self.publish_workspace_marker()
-        except Exception as e: self.get_logger().error(f'Failed to publish workspace marker: {e}')
+                
+        # [MODIFIED] Corrected indentation for try-except block
+        try: 
+            self.publish_workspace_marker()
+        except Exception as e: 
+            self.get_logger().error(f'Failed to publish workspace marker: {e}')
 
 def main(args=None):
     rclpy.init(args=args)

@@ -72,22 +72,16 @@ class MotionPlannerNode(Node):
         self.position_tolerance = self.get_parameter('position_tolerance').get_parameter_value().double_value
         self.orientation_tolerance = self.get_parameter('orientation_tolerance').get_parameter_value().double_value
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
-        sim_path = ""
         # Find model path
         if model_path_param:
+            # 1. 파라미터로 경로가 전달된 경우 (launch 파일에서 전달됨)
             model_path = Path(model_path_param)
-        # else:
-        #     # Default: look relative to workspace
-        #     model_path = Path(__file__).parent.parent.parent.parent.parent.parent / \
-        #         'simulation/assets/mujoco/tidybot_wx250s_bimanual.xml'
-
-        else:
+        elif os.environ.get('TIDYBOT_SIMULATION_PATH'):
+            # 2. 환경 변수가 있는 경우
             sim_path = os.environ.get('TIDYBOT_SIMULATION_PATH')
-        if sim_path:
-                # 2. Look in TIDYBOT_SIMULATION_PATH
             model_path = Path(sim_path) / 'assets/mujoco/tidybot_wx250s_bimanual.xml'
         else:
-            # 3. If no environment variable is set, raise an error
+            # 3. 둘 다 없는 경우 에러 발생
             self.get_logger().error("Environment variable 'TIDYBOT_SIMULATION_PATH' not set!")
             raise EnvironmentError("Please source setup_env.bash or set TIDYBOT_SIMULATION_PATH")
         
