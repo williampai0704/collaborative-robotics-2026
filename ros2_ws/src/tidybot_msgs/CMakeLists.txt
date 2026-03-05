@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SolveIK.srv"
   "srv/GetJointState.srv"
   "srv/PlanToTarget.srv"
+  "action/SequenceTask.action"
   "srv/AudioRecord.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces
 )
