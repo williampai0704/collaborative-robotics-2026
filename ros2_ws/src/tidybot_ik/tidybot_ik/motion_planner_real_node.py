@@ -62,7 +62,7 @@ class MotionPlannerRealNode(Node):
         # Declare parameters for IK solver, tolerances, and safety margins
         self.declare_parameter('urdf_path', '')
         self.declare_parameter('ik_dt', 0.3)
-        self.declare_parameter('ik_max_iterations', 500)
+        self.declare_parameter('ik_max_iterations', 200)
         self.declare_parameter('position_tolerance', 0.03)
         self.declare_parameter('orientation_tolerance', 0.1)
         self.declare_parameter('min_collision_distance', 0.05)  # Safe distance boundary (5cm)
@@ -137,12 +137,6 @@ class MotionPlannerRealNode(Node):
                 if self.model.existFrame(alt_name):
                     self.ee_frame_ids[arm] = self.model.getFrameId(alt_name)
 
-        # =========================================================================
-        # [PORTED FROM SIMULATION] 1. Expanded Collision Bodies
-        # Originally, the real node only checked a few arm links.
-        # This has been updated to include gripper fingers, gripper bars, 
-        # and the robot base/camera mounts for comprehensive collision checking.
-        # =========================================================================
         self.collision_frames = {
             'right': [
                 'right_upper_arm_link', 'right_upper_forearm_link', 'right_lower_forearm_link', 
@@ -166,8 +160,6 @@ class MotionPlannerRealNode(Node):
             for fname in self.collision_frames[group]:
                 if self.model.existFrame(fname):
                     self.collision_frame_ids[group].append(self.model.getFrameId(fname))
-                else:
-                    self.get_logger().warn(f"Collision frame '{fname}' not found in URDF. Checking might be limited.")
 
         # Thread-safe storage for current joint positions
         self.current_joint_positions = {}
@@ -179,7 +171,6 @@ class MotionPlannerRealNode(Node):
             'left': self.create_publisher(JointGroupCommand, '/left_arm/commands/joint_group', 10),
         }
 
-        # Publisher and timer for RViz workspace visualization and real-time bounds checking
         self.workspace_marker_pub = self.create_publisher(Marker, 'workspace_marker', 10)
         self.create_timer(0.5, self.safety_timer_callback)
 
@@ -190,24 +181,21 @@ class MotionPlannerRealNode(Node):
 
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
-        self.get_logger().info('Motion planner (real hardware) initialized with advanced safety checks.')
+        self.get_logger().info('Motion planner (real hardware) initialized with 2-step Hover & Descend logic.')
 
     def _process_xacro(self, xacro_path: Path) -> str:
-        """Helper method to parse xacro files into standard URDF string."""
         if xacro_path.suffix == '.xacro':
             result = subprocess.run(['xacro', str(xacro_path)], capture_output=True, text=True, check=True)
             return result.stdout
         return xacro_path.read_text()
 
     def joint_state_callback(self, msg: JointState):
-        """Callback to update the internal representation of the robot's current joint states."""
         with self.joint_lock:
             for i, name in enumerate(msg.name):
                 if i < len(msg.position):
                     self.current_joint_positions[name] = msg.position[i]
 
     def get_arm_joint_positions(self, arm_name: str, use_default_if_zero: bool = True) -> np.ndarray:
-        """Retrieves the current joint positions for a specific arm, avoiding singular zero-states."""
         with self.joint_lock:
             positions = np.zeros(6)
             for i, jname in enumerate(self.arm_joints[arm_name]):
@@ -217,7 +205,6 @@ class MotionPlannerRealNode(Node):
             return positions
 
     def set_arm_configuration(self, q: np.ndarray, arm_name: str, positions: np.ndarray):
-        """Helper to inject specific arm joint positions into the full robot configuration vector 'q'."""
         for i, jname in enumerate(self.arm_joints[arm_name]):
             if jname in self.joint_ids:
                 jid = self.joint_ids[jname]
@@ -225,7 +212,6 @@ class MotionPlannerRealNode(Node):
                 q[idx] = positions[i]
 
     def numerical_jacobian(self, q: np.ndarray, arm_name: str, ee_frame_id: int, use_orientation: bool = False, eps: float = 1e-4) -> np.ndarray:
-        """Computes the numerical Jacobian matrix for IK, bypassing issues with floating base analytical Jacobians."""
         arm_idx_q = [self.model.joints[self.joint_ids[jname]].idx_q for jname in self.arm_joints[arm_name] if jname in self.joint_ids]
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
@@ -247,7 +233,6 @@ class MotionPlannerRealNode(Node):
         return J
 
     def get_arm_from_configuration(self, q: np.ndarray, arm_name: str) -> np.ndarray:
-        """Extracts the joint positions of a specific arm from the full configuration vector 'q'."""
         positions = np.zeros(6)
         for i, jname in enumerate(self.arm_joints[arm_name]):
             if jname in self.joint_ids:
@@ -257,18 +242,15 @@ class MotionPlannerRealNode(Node):
         return positions
 
     def pose_to_se3(self, pose: Pose) -> pin.SE3:
-        """Converts ROS geometry_msgs/Pose to Pinocchio SE3 format."""
         position = np.array([pose.position.x, pose.position.y, pose.position.z])
         quat = pin.Quaternion(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z)
         return pin.SE3(quat.matrix(), position)
 
     def is_in_workspace(self, position: np.ndarray) -> bool:
-        """Checks if a given 3D coordinate falls within the allowed workspace bounding box."""
         pos = np.asarray(position)
         return bool(np.all(pos >= self.workspace_min) and np.all(pos <= self.workspace_max))
 
     def solve_ik(self, arm_name: str, target_pose: pin.SE3, use_orientation: bool, seed: np.ndarray) -> tuple:
-        """Solves Inverse Kinematics using Damped Least Squares (Closed-Loop IK) via Pinocchio."""
         q = pin.neutral(self.model)
         self.set_arm_configuration(q, arm_name, seed)
         other_arm = 'left' if arm_name == 'right' else 'right'
@@ -276,8 +258,7 @@ class MotionPlannerRealNode(Node):
         self.set_arm_configuration(q, other_arm, other_positions)
 
         ee_frame_id = self.ee_frame_ids.get(arm_name)
-        if ee_frame_id is None:
-            return False, seed, float('inf'), float('inf')
+        if ee_frame_id is None: return False, seed, float('inf'), float('inf')
 
         arm_idx_q = [self.model.joints[self.joint_ids[jname]].idx_q for jname in self.arm_joints[arm_name] if jname in self.joint_ids]
         target_position, target_rotation = target_pose.translation, target_pose.rotation
@@ -326,7 +307,6 @@ class MotionPlannerRealNode(Node):
         return success, solution, position_error, orientation_error
 
     def compute_jacobian_condition(self, arm_name: str, joint_positions: np.ndarray) -> float:
-        """Calculates the condition number of the Jacobian matrix to detect and avoid kinematic singularities."""
         q = pin.neutral(self.model)
         self.set_arm_configuration(q, arm_name, joint_positions)
         ee_frame_id = self.ee_frame_ids.get(arm_name)
@@ -337,193 +317,175 @@ class MotionPlannerRealNode(Node):
         except: return float('inf')
 
     def check_arm_collision(self, joint_positions_right: np.ndarray, joint_positions_left: np.ndarray) -> tuple:
-        """
-        =========================================================================
-        [PORTED FROM SIMULATION] 2. Comprehensive Collision Check
-        Calculates the minimum Euclidean distance between the center points of 
-        all predefined collision frames. Checks:
-        1. Right Arm vs Left Arm
-        2. Right Arm vs Base/Mounts
-        3. Left Arm vs Base/Mounts
-        =========================================================================
-        """
         q = pin.neutral(self.model)
         self.set_arm_configuration(q, 'right', joint_positions_right)
         self.set_arm_configuration(q, 'left', joint_positions_left)
-
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
 
         min_distance = float('inf')
-
-        # Extract real-time cartesian positions for all defined frames
         pos_right = [self.data.oMf[fid].translation for fid in self.collision_frame_ids['right']]
         pos_left = [self.data.oMf[fid].translation for fid in self.collision_frame_ids['left']]
         pos_base = [self.data.oMf[fid].translation for fid in self.collision_frame_ids['base']]
 
-        # 1. Right Arm vs Left Arm
         for pr in pos_right:
-            for pl in pos_left:
-                min_distance = min(min_distance, np.linalg.norm(pr - pl))
-
-        # 2. Right Arm vs Base/Mounts
+            for pl in pos_left: min_distance = min(min_distance, np.linalg.norm(pr - pl))
         for pr in pos_right:
-            for pb in pos_base:
-                min_distance = min(min_distance, np.linalg.norm(pr - pb))
-
-        # 3. Left Arm vs Base/Mounts
+            for pb in pos_base: min_distance = min(min_distance, np.linalg.norm(pr - pb))
         for pl in pos_left:
-            for pb in pos_base:
-                min_distance = min(min_distance, np.linalg.norm(pl - pb))
+            for pb in pos_base: min_distance = min(min_distance, np.linalg.norm(pl - pb))
 
-        collision_free = min_distance >= self.min_collision_distance
-        return collision_free, min_distance
+        return min_distance >= self.min_collision_distance, min_distance
+
+    # [NEW] Path validation helper (extracted for clean reuse in 2-step planning)
+    def _validate_path(self, arm_name: str, start_q: np.ndarray, goal_q: np.ndarray, other_arm_q: np.ndarray, steps: int = 20) -> tuple:
+        """Interpolates between start and goal joint positions and checks for collisions."""
+        for i in range(1, steps + 1):
+            alpha = i / steps
+            interp_q = (1 - alpha) * start_q + alpha * goal_q
+            
+            if arm_name == 'right':
+                free, dist = self.check_arm_collision(interp_q, other_arm_q)
+            else:
+                free, dist = self.check_arm_collision(other_arm_q, interp_q)
+
+            if not free:
+                return False, dist
+        return True, 1.0
 
     def plan_to_target_callback(self, request, response):
-        """Primary service callback to process movement requests, solve IK, validate safety, and execute."""
+        """
+        [MODIFIED] 2-Step Sequence Planner embedded in the service.
+        Automatically calculates a hover position (z=0.5), validates it,
+        calculates the descent path, and if both are safe, executes the sequence.
+        """
         arm_name = request.arm_name.lower()
         if arm_name not in ['right', 'left']:
-            response.success, response.message = False, f"Invalid arm_name '{request.arm_name}'."
+            response.success, response.message = False, "Invalid arm_name."
             return response
 
-        mode = 'pos+orient' if request.use_orientation else 'pos-only'
-        self.get_logger().info(f'Planning for {arm_name} arm ({mode})...')
-
+        self.get_logger().info(f'Starting 2-Step Planning for {arm_name} arm...')
         primary_seed = self.get_arm_joint_positions(arm_name)
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
 
-        target_se3 = self.pose_to_se3(request.target_pose)
+        # 1. Define Final Target
+        final_target_se3 = self.pose_to_se3(request.target_pose)
         
-        # Abort if the target falls outside the safe workspace box
-        if not self.is_in_workspace(target_se3.translation):
-            response.success, response.message = False, 'Target out of workspace'
+        # 2. Define Hover Target (z is overridden to 0.5)
+        hover_target_se3 = self.pose_to_se3(request.target_pose)
+        hover_target_se3.translation[2] = 0.5
+
+        if not self.is_in_workspace(hover_target_se3.translation) or not self.is_in_workspace(final_target_se3.translation):
+            response.success, response.message = False, 'Hover or Final target is out of safe workspace bounds.'
             self.get_logger().warn(response.message)
             return response
 
-        # Prepare multi-seed list to avoid IK local minima
+        # =========================================================
+        # PHASE 1: Plan to Hover (z=0.5)
+        # =========================================================
+        self.get_logger().info('Phase 1: Planning approach to Hover (z=0.5)')
         seeds = [primary_seed]
         for extra in self.EXTRA_SEEDS:
             if arm_name == 'left':
                 mirrored = extra.copy()
-                mirrored[0] = -mirrored[0]
-                mirrored[3] = -mirrored[3]
+                mirrored[0], mirrored[3] = -mirrored[0], -mirrored[3]
                 seeds.append(mirrored)
             else:
                 seeds.append(extra.copy())
 
-        # Attempt to solve IK using multiple seeds, keep the result with the lowest error
-        best_result, seeds_tried = None, 0
+        best_hover, hover_pos_err, hover_ori_err = None, float('inf'), float('inf')
         for seed in seeds[:self.max_ik_seeds]:
-            seeds_tried += 1
-            ik_success, solution, pos_error, ori_error = self.solve_ik(arm_name, target_se3, request.use_orientation, seed)
-            if ik_success:
-                total_err = pos_error + ori_error
-                if best_result is None or total_err < (best_result[1] + best_result[2]):
-                    best_result = (solution, pos_error, ori_error)
-                # Break early if the solution is exceptionally good
-                if pos_error < self.position_tolerance * 0.5 and (not request.use_orientation or ori_error < self.orientation_tolerance * 0.5):
-                    break
+            success, sol, p_err, o_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, seed)
+            if success:
+                if best_hover is None or (p_err + o_err) < (hover_pos_err + hover_ori_err):
+                    best_hover, hover_pos_err, hover_ori_err = sol, p_err, o_err
+                if p_err < self.position_tolerance * 0.5: break
 
-        if best_result is not None:
-            solution, pos_error, ori_error = best_result
+        if best_hover is not None:
+            hover_solution = best_hover
         else:
-            # Fallback to primary seed if all fail to meet strict tolerances
-            _, solution, pos_error, ori_error = self.solve_ik(arm_name, target_se3, request.use_orientation, primary_seed)
-
-        response.position_error, response.orientation_error, response.joint_positions = pos_error, ori_error, solution.tolist()
-
-        if best_result is None:
-            response.success, response.message = False, f"IK failed: pos_err={pos_error:.4f}m, ori_err={ori_error:.4f}rad"
-            self.get_logger().warn(response.message)
-            return response
-
-        self.get_logger().info('IK solution found. Checking singularity and collisions...')
-        
-        # Validate that the final configuration is far from kinematic singularities
-        condition_number = self.compute_jacobian_condition(arm_name, solution)
-        response.condition_number = condition_number
-
-        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 100.0
-        if condition_number > max_cond:
-            response.success, response.message = False, f"Near singularity: condition number={condition_number:.1f} > {max_cond}"
-            self.get_logger().warn(response.message)
-            return response
-
-        self.get_logger().info('Configuration is not near singularity. Checking collisions...')
-        
-        # Static collision check at the final goal configuration
-        if arm_name == 'right': collision_free, min_dist = self.check_arm_collision(solution, other_arm_positions)
-        else: collision_free, min_dist = self.check_arm_collision(other_arm_positions, solution)
-
-        if not collision_free:
-            response.success, response.message = False, f"Arm collision detected: min distance={min_dist:.3f}m < {self.min_collision_distance}m"
-            self.get_logger().warn(response.message)
-            return response
-
-        self.get_logger().info('No collisions at solution configuration. Validating path for collisions...')
-        
-        # =========================================================================
-        # [PORTED FROM SIMULATION] 3. Path Validation
-        # Slices the trajectory from current position to goal position into 20 steps.
-        # Checks for collisions at every interpolated waypoint to prevent the arm
-        # from swinging through an obstacle (or the other arm) to reach a safe goal.
-        # =========================================================================
-        steps = 20
-        start_joints = self.get_arm_joint_positions(arm_name)
-        goal_joints = solution.copy()
-        
-        for i in range(1, steps + 1):
-            alpha = i / steps
-            interp_joints = (1 - alpha) * start_joints + alpha * goal_joints
-            
-            if arm_name == 'right':
-                path_collision_free, path_min_dist = self.check_arm_collision(interp_joints, other_arm_positions)
-            else:
-                path_collision_free, path_min_dist = self.check_arm_collision(other_arm_positions, interp_joints)
-
-            if not path_collision_free:
-                response.success = False
-                response.message = f"Collision detected along path at step {i}/{steps}: min distance={path_min_dist:.3f}m < {self.min_collision_distance}m"
+            _, hover_solution, hover_pos_err, hover_ori_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, primary_seed)
+            if hover_pos_err > self.position_tolerance:
+                response.success, response.message = False, f"Phase 1 IK failed: pos_err={hover_pos_err:.4f}m"
                 self.get_logger().warn(response.message)
                 return response
 
-        self.get_logger().info('Path is collision-free. Planning successful...')
+        # =========================================================
+        # PHASE 2: Plan to Descend (Final Target)
+        # =========================================================
+        self.get_logger().info(f'Phase 2: Planning descend to target (z={final_target_se3.translation[2]:.3f})')
+        # [KEY LOGIC] Use hover_solution as the ONLY seed. This guarantees the robot
+        # reaches straight down without twisting elbows or flipping configurations.
+        ik_success, final_solution, final_pos_err, final_ori_err = self.solve_ik(
+            arm_name, final_target_se3, request.use_orientation, hover_solution
+        )
 
+        if not ik_success:
+            response.success, response.message = False, f"Phase 2 IK failed: pos_err={final_pos_err:.4f}m"
+            self.get_logger().warn(response.message)
+            return response
+
+        # Check Singularity for both solutions
+        cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
+        cond_final = self.compute_jacobian_condition(arm_name, final_solution)
+        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 100.0
+
+        if cond_hover > max_cond or cond_final > max_cond:
+            response.success, response.message = False, f"Near singularity detected (cond={max(cond_hover, cond_final):.1f})"
+            self.get_logger().warn(response.message)
+            return response
+
+        # =========================================================
+        # PHASE 3: Path Validation (Collisions)
+        # =========================================================
+        # Path 1: Current -> Hover
+        free_1, min_dist_1 = self._validate_path(arm_name, primary_seed, hover_solution, other_arm_positions)
+        if not free_1:
+            response.success, response.message = False, f"Collision in Hover path: min_dist={min_dist_1:.3f}m"
+            self.get_logger().warn(response.message)
+            return response
+
+        # Path 2: Hover -> Final Target
+        free_2, min_dist_2 = self._validate_path(arm_name, hover_solution, final_solution, other_arm_positions)
+        if not free_2:
+            response.success, response.message = False, f"Collision in Descend path: min_dist={min_dist_2:.3f}m"
+            self.get_logger().warn(response.message)
+            return response
+
+        # All checks passed!
         response.success = True
-        response.message = f"Planning succeeded: pos_err={pos_error:.4f}m, cond={condition_number:.1f}, min_dist={min_dist:.3f}m"
-        
-        # Dispatch hardware commands if requested
+        response.message = f"2-Step Planning successful. Hover_err={hover_pos_err:.4f}m, Final_err={final_pos_err:.4f}m"
+        response.position_error = final_pos_err
+        response.orientation_error = final_ori_err
+        response.joint_positions = final_solution.tolist()
+
         if request.execute:
-            # [MODIFIED] Spawning a background thread to prevent ROS 2 executor blocking during time.sleep()
+            # Spawn sequence thread
             exec_thread = threading.Thread(
-                target=self.execute_trajectory,
-                args=(arm_name, solution, request.duration),
+                target=self.execute_sequence,
+                args=(arm_name, hover_solution, final_solution, request.duration),
                 daemon=True
             )
             exec_thread.start()
             response.executed = True
-            self.get_logger().info(f'Started executing motion over {request.duration}s in background thread.')
+            self.get_logger().info(f'Starting sequence execution in background thread.')
         else:
             response.executed = False
 
         return response
 
-    def execute_trajectory(self, arm_name: str, target: np.ndarray, duration: float):
-        """Generates a smooth cosine-interpolated trajectory and streams commands to the real hardware."""
-        start = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
+    # [NEW] Helper function to execute a single motion segment
+    def _execute_motion_step(self, arm_name: str, start_q: np.ndarray, target_q: np.ndarray, duration: float):
         rate_hz, dt = 50.0, 1.0 / 50.0
         num_steps = max(int(duration * rate_hz), 1)
 
-        self.get_logger().info(f'Executing {arm_name} trajectory: {num_steps} steps over {duration}s')
         for i in range(num_steps + 1):
             t = i / num_steps
-            # Apply smooth start/stop easing (cosine profile)
             alpha = 0.5 * (1 - np.cos(np.pi * t))
-            q = start + alpha * (target - start)
+            q = start_q + alpha * (target_q - start_q)
 
             cmd = JointGroupCommand()
-            # [KEPT ORIGINAL] Retained your original custom namespace structure for the real hardware
             cmd.name = f'{arm_name}_arm'  
             cmd.cmd = q.tolist()
             self.arm_cmd_pubs[arm_name].publish(cmd)
@@ -531,8 +493,25 @@ class MotionPlannerRealNode(Node):
             if i < num_steps: 
                 time.sleep(dt)
 
+    # [NEW] Method to execute the 2-step sequence (Hover -> Wait -> Descend)
+    def execute_sequence(self, arm_name: str, hover_q: np.ndarray, final_q: np.ndarray, duration: float):
+        """Executes the full trajectory: Move to Hover -> Wait 5s -> Move to Target."""
+        # 1. Move to Hover
+        self.get_logger().info(f'[{arm_name.upper()} ARM] Step 1: Moving to hover (z=0.5) over {duration}s...')
+        current_q = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
+        self._execute_motion_step(arm_name, current_q, hover_q, duration)
+
+        # 2. Wait 5 Seconds
+        self.get_logger().info(f'[{arm_name.upper()} ARM] Hover reached. Waiting for 5.0 seconds...')
+        time.sleep(5.0)
+
+        # 3. Descend to Final Target
+        self.get_logger().info(f'[{arm_name.upper()} ARM] Step 2: Descending to final target over {duration}s...')
+        self._execute_motion_step(arm_name, hover_q, final_q, duration)
+        
+        self.get_logger().info(f'[{arm_name.upper()} ARM] 🟢 Sequence successfully completed!')
+
     def publish_workspace_marker(self):
-        """Publishes an RViz marker to visually display the safe workspace bounding box."""
         marker = Marker()
         marker.header.frame_id = self.workspace_frame
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -545,7 +524,6 @@ class MotionPlannerRealNode(Node):
         self.workspace_marker_pub.publish(marker)
 
     def safety_timer_callback(self):
-        """Continuous background loop that monitors if either end-effector escapes the safe workspace."""
         for arm in ['right', 'left']:
             ee_frame_id = self.ee_frame_ids.get(arm)
             if ee_frame_id is None: continue
@@ -562,11 +540,11 @@ class MotionPlannerRealNode(Node):
             if not self.is_in_workspace(ee_pos):
                 self.get_logger().warn(f'{arm.capitalize()} end-effector out of workspace: {ee_pos}')
                 
-        # [MODIFIED] Corrected indentation for try-except block
         try: 
             self.publish_workspace_marker()
         except Exception as e: 
             self.get_logger().error(f'Failed to publish workspace marker: {e}')
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -579,3 +557,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
