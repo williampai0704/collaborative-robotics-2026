@@ -12,13 +12,16 @@ Orchestrates the existing motion and vision modules via ROS2 topics:
     test-merge.py        → subscribes /motion_command, /stop_motion
                          → publishes  /cmd_vel
 
+  Manipulation node expected to be running:
+    motion_planner_node  → serves /plan_to_target (tidybot_msgs/PlanToTarget)
+
   This node:
     Subscribes : /mask_center       — pixel centroid of the detected object
                  /object_pose       — 6-DOF pose in camera_depth_optical_frame
     Publishes  : /motion_command    — "search" to spin, used with /stop_motion
                  /stop_motion       — Bool True to halt the motion module
                  /camera/pan_tilt_cmd — [pan, tilt] to centre object vertically
-                 /manipulation/object_pose — final pose in base_link (pseudo module)
+    Calls      : /plan_to_target    — motion planner service (PlanToTarget)
 
 Pipeline (state machine):
   INIT → SPINNING → TILT_ADJUST → WAIT_POSE → SEND_TO_MANIPULATION → DONE
@@ -33,7 +36,10 @@ Usage:
     # Terminal 3 – vision: pose estimator
     ros2 run tidybot_bringup simple_pose_fit.py --ros-args -p target_color:=yellow
 
-    # Terminal 4 – this orchestrator
+    # Terminal 4 – motion planner
+    ros2 run tidybot_ik motion_planner_node
+
+    # Terminal 5 – this orchestrator
     ros2 run tidybot_bringup task_1.py
 """
 
@@ -46,6 +52,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 import tf2_ros
 
@@ -53,6 +61,8 @@ from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import Bool, String, Float64MultiArray
 
 from scipy.spatial.transform import Rotation as ScipyRotation
+
+from tidybot_msgs.srv import PlanToTarget
 
 # =============================================================================
 # Configuration
@@ -75,6 +85,9 @@ TILT_MAX  =  0.5       # rad  (tilt up)
 # How long to wait for a fresh /object_pose after stopping
 POSE_WAIT_TIMEOUT = 8.0   # s
 
+# How long to wait for /plan_to_target service result (includes execution time)
+RESULT_TIMEOUT = 30.0   # s
+
 # =============================================================================
 # States
 # =============================================================================
@@ -84,7 +97,7 @@ class State(Enum):
     SPINNING             = auto()  # command motion module to spin; watch mask centre
     TILT_ADJUST          = auto()  # stop base, adjust camera tilt for vertical centre
     WAIT_POSE            = auto()  # wait for a fresh /object_pose from simple_pose_fit
-    SEND_TO_MANIPULATION = auto()  # transform pose → base_link and publish
+    SEND_TO_MANIPULATION = auto()  # call /plan_to_target with pose in base_link
     DONE                 = auto()
 
 # =============================================================================
@@ -95,6 +108,13 @@ class Task1Node(Node):
 
     def __init__(self):
         super().__init__('task_1')
+
+        # ── Parameters ──────────────────────────────────────────────────────
+        self.declare_parameter('arm_name', 'right')
+        self.arm_name: str = self.get_parameter('arm_name').value
+
+        # ── Callback groups ──────────────────────────────────────────────────
+        self.client_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ── Publishers ──────────────────────────────────────────────────────
         # Motion module interface
@@ -107,9 +127,10 @@ class Task1Node(Node):
         self.pan_tilt_pub = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
-        # Pseudo manipulation module
-        self.manip_pub = self.create_publisher(
-            PoseStamped, '/manipulation/object_pose', 10)
+        # ── Service client ───────────────────────────────────────────────────
+        self.plan_client = self.create_client(
+            PlanToTarget, '/plan_to_target',
+            callback_group=self.client_cb_group)
 
         # ── Subscribers ─────────────────────────────────────────────────────
         # From find_center node – pixel centroid of colour-masked object
@@ -132,6 +153,8 @@ class Task1Node(Node):
         self._cmd_pan:  float = 0.0
         self._cmd_tilt: float = 0.0
 
+        self._pending_future = None   # async service call future
+
         # ── State machine ────────────────────────────────────────────────────
         self.state       = State.INIT
         self.state_start = time.time()
@@ -140,6 +163,7 @@ class Task1Node(Node):
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('Task 1: Spin → Find → Centre → Pose → Manipulate')
+        self.get_logger().info(f'Arm: {self.arm_name}')
         self.get_logger().info('Waiting for /mask_center from find_center node …')
         self.get_logger().info('=' * 55)
 
@@ -332,30 +356,66 @@ class Task1Node(Node):
                     throttle_duration_sec=1.0)
 
         # ── SEND_TO_MANIPULATION ──────────────────────────────────────────────
-        # Transform pose from camera frame to base_link and hand off.
+        # Transform pose from camera frame to base_link and call /plan_to_target.
         elif self.state == State.SEND_TO_MANIPULATION:
-            if elapsed < 0.1:  # execute once on entry
+
+            # ── Step 1: send service request once on entry ────────────────────
+            if self._pending_future is None and elapsed < 0.2:
                 pose_base = self._transform_to_base(self.object_pose)
                 if pose_base is None:
-                    if elapsed < 5.0:
-                        return   # retry on next tick
                     self.get_logger().error('TF transform failed – aborting')
                     self._transition(State.DONE)
                     return
 
-                self.manip_pub.publish(pose_base)
+                if not self.plan_client.service_is_ready():
+                    self.get_logger().warn(
+                        'Waiting for /plan_to_target service …',
+                        throttle_duration_sec=1.0)
+                    return
+
+                req = PlanToTarget.Request()
+                req.arm_name          = self.arm_name
+                req.target_pose       = pose_base.pose
+                req.use_orientation   = True
+                req.max_condition_number = 100.0
+                req.execute           = True
+                req.duration          = 5.0
+
+                self._pending_future = self.plan_client.call_async(req)
 
                 p = pose_base.pose.position
                 q = pose_base.pose.orientation
                 self.get_logger().info('=' * 55)
-                self.get_logger().info('Object pose sent to manipulation module')
+                self.get_logger().info('Calling /plan_to_target')
+                self.get_logger().info(f'  Arm        : {self.arm_name}')
                 self.get_logger().info(f'  Frame      : base_link')
                 self.get_logger().info(
                     f'  Position   : ({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) m')
                 self.get_logger().info(
                     f'  Orientation: ({q.x:.4f}, {q.y:.4f}, {q.z:.4f}, {q.w:.4f})')
-                self.get_logger().info('  Topic      : /manipulation/object_pose')
                 self.get_logger().info('=' * 55)
+                return
+
+            # ── Step 2: poll future until done ────────────────────────────────
+            if self._pending_future is not None:
+                if not self._pending_future.done():
+                    if elapsed > RESULT_TIMEOUT:
+                        self.get_logger().error(
+                            '/plan_to_target service timed out')
+                        self._pending_future = None
+                        self._transition(State.DONE)
+                    return
+
+                result = self._pending_future.result()
+                self._pending_future = None
+
+                if result.success:
+                    self.get_logger().info(
+                        f'Motion planning succeeded: {result.message}')
+                else:
+                    self.get_logger().error(
+                        f'Motion planning failed: {result.message}')
+
                 self._transition(State.DONE)
 
         # ── DONE ─────────────────────────────────────────────────────────────
@@ -371,8 +431,10 @@ class Task1Node(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Task1Node()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

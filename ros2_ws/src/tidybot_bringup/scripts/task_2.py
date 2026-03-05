@@ -4,7 +4,7 @@ Task 2: Pick up {block_color} block and put it in {bin_color} bin
 
 Orchestrates the existing motion and vision modules via ROS2 topics.
 
-─── Vision nodes to run ───────────────────────────────────────────────────────
+─── Nodes to run ──────────────────────────────────────────────────────────────
 Phase 1 (block):
     ros2 run tidybot_bringup find_center.py     --ros-args -p target_color:=yellow
     ros2 run tidybot_bringup obj_dist.py        --ros-args -p target_color:=yellow
@@ -16,20 +16,22 @@ Phase 2 (bin) — restart vision nodes with new color when task_2 publishes
     ros2 run tidybot_bringup obj_dist.py        --ros-args -p target_color:=blue
     ros2 run tidybot_bringup simple_pose_fit.py --ros-args -p target_color:=blue
 
+Motion planner (manipulation):
+    ros2 run tidybot_ik motion_planner_node
+
 ─── Topics ────────────────────────────────────────────────────────────────────
 Subscribes:
   /mask_center                  geometry_msgs/Point    ← find_center
   /vision/object_distance       std_msgs/Float32       ← obj_dist
   /object_pose                  geometry_msgs/PoseStamped ← simple_pose_fit
-  /manipulation/grasp_result    std_msgs/Bool          ← manipulation module
-  /manipulation/place_result    std_msgs/Bool          ← manipulation module
 
 Publishes:
   /cmd_vel                      geometry_msgs/Twist    → base motion
   /camera/pan_tilt_cmd          std_msgs/Float64MultiArray → camera tilt
   /vision/target_color          std_msgs/String        → signal vision nodes to switch color
-  /manipulation/grasp_target    geometry_msgs/PoseStamped → pseudo manipulation
-  /manipulation/place_target    geometry_msgs/PoseStamped → pseudo manipulation
+
+Calls:
+  /plan_to_target               tidybot_msgs/PlanToTarget → motion planner
 
 ─── State machine ─────────────────────────────────────────────────────────────
   INIT
@@ -43,7 +45,7 @@ Publishes:
     ↓ (v_err < VERTICAL_TOL)
   WAIT_BLOCK_POSE  wait for fresh /object_pose from simple_pose_fit
     ↓
-  GRASP            send to /manipulation/grasp_target; wait for result
+  GRASP            call /plan_to_target for grasp pose; wait for result
     ↑ (failed, retries left) → back to WAIT_BLOCK_POSE
     ↓ (success)
   FIND_BIN         publish /vision/target_color=bin_color; spin to find bin
@@ -55,14 +57,14 @@ Publishes:
     ↓
   WAIT_BIN_POSE    wait for fresh /object_pose
     ↓
-  PLACE            send to /manipulation/place_target; wait for result
+  PLACE            call /plan_to_target for place pose; wait for result
     ↓
   DONE / ERROR
 
 Usage:
     ros2 run tidybot_bringup task_2.py
     ros2 run tidybot_bringup task_2.py \\
-        --ros-args -p block_color:=yellow -p bin_color:=blue
+        --ros-args -p block_color:=yellow -p bin_color:=blue -p arm_name:=right
 """
 
 import time
@@ -74,13 +76,17 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from std_msgs.msg import Bool, Float32, String, Float64MultiArray
+from std_msgs.msg import Float32, String, Float64MultiArray
 
 from scipy.spatial.transform import Rotation as ScipyRotation
+
+from tidybot_msgs.srv import PlanToTarget
 
 # =============================================================================
 # Configuration
@@ -104,8 +110,8 @@ TILT_GAIN       = 0.001 # rad / px
 TILT_MIN        = -1.2  # rad
 TILT_MAX        =  0.5  # rad
 
-POSE_WAIT_TIMEOUT  = 8.0  # s
-RESULT_TIMEOUT     = 15.0 # s — max wait for manipulation result
+POSE_WAIT_TIMEOUT  = 8.0   # s
+RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target result (includes execution)
 MAX_GRASP_RETRIES  = 3
 
 # =============================================================================
@@ -119,13 +125,13 @@ class State(Enum):
     APPROACH_BLOCK = auto()   # drive forward; stop when close enough
     TILT_BLOCK     = auto()   # centre block vertically in camera
     WAIT_BLOCK_POSE= auto()   # wait for fresh /object_pose
-    GRASP          = auto()   # send grasp target; wait for result
+    GRASP          = auto()   # call /plan_to_target for grasp; wait for result
     # ── Bin ───────────────────────────────
     FIND_BIN       = auto()   # spin to centre bin horizontally
     APPROACH_BIN   = auto()   # drive forward; stop when close enough
     TILT_BIN       = auto()   # centre bin vertically in camera
     WAIT_BIN_POSE  = auto()   # wait for fresh /object_pose
-    PLACE          = auto()   # send place target; wait for result
+    PLACE          = auto()   # call /plan_to_target for place; wait for result
     # ─────────────────────────────────────
     DONE           = auto()
     ERROR          = auto()
@@ -142,40 +148,45 @@ class Task2Node(Node):
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter('block_color', 'yellow')
         self.declare_parameter('bin_color',   'blue')
+        self.declare_parameter('arm_name',    'right')
 
         self.block_color: str = self.get_parameter('block_color').value
         self.bin_color:   str = self.get_parameter('bin_color').value
+        self.arm_name:    str = self.get_parameter('arm_name').value
+
+        # ── Callback groups ──────────────────────────────────────────────────
+        self.client_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ── Publishers ──────────────────────────────────────────────────────
-        self.cmd_vel_pub    = self.create_publisher(Twist,             '/cmd_vel',                   10)
-        self.pan_tilt_pub   = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd',       10)
-        self.color_pub      = self.create_publisher(String,            '/vision/target_color',       10)
-        self.grasp_pub      = self.create_publisher(PoseStamped,       '/manipulation/grasp_target', 10)
-        self.place_pub      = self.create_publisher(PoseStamped,       '/manipulation/place_target', 10)
+        self.cmd_vel_pub  = self.create_publisher(Twist,             '/cmd_vel',              10)
+        self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd',  10)
+        self.color_pub    = self.create_publisher(String,            '/vision/target_color',  10)
+
+        # ── Service client ───────────────────────────────────────────────────
+        self.plan_client = self.create_client(
+            PlanToTarget, '/plan_to_target',
+            callback_group=self.client_cb_group)
 
         # ── Subscribers ─────────────────────────────────────────────────────
-        self.create_subscription(Point,       '/mask_center',               self._mask_center_cb,    10)
-        self.create_subscription(Float32,     '/vision/object_distance',    self._obj_dist_cb,       10)
-        self.create_subscription(PoseStamped, '/object_pose',               self._object_pose_cb,    10)
-        self.create_subscription(Bool,        '/manipulation/grasp_result', self._grasp_result_cb,   10)
-        self.create_subscription(Bool,        '/manipulation/place_result', self._place_result_cb,   10)
+        self.create_subscription(Point,       '/mask_center',            self._mask_center_cb, 10)
+        self.create_subscription(Float32,     '/vision/object_distance', self._obj_dist_cb,    10)
+        self.create_subscription(PoseStamped, '/object_pose',            self._object_pose_cb, 10)
 
         # ── TF2 ─────────────────────────────────────────────────────────────
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ── Shared state ─────────────────────────────────────────────────────
-        self.mask_center:      Optional[Point]       = None
-        self.object_distance:  Optional[float]       = None
-        self.object_pose:      Optional[PoseStamped] = None
-        self.pose_timestamp:   Optional[float]       = None
-
-        self.grasp_result:     Optional[bool]        = None
-        self.place_result:     Optional[bool]        = None
+        self.mask_center:     Optional[Point]       = None
+        self.object_distance: Optional[float]       = None
+        self.object_pose:     Optional[PoseStamped] = None
+        self.pose_timestamp:  Optional[float]       = None
 
         self._cmd_pan:  float = 0.0
         self._cmd_tilt: float = 0.0
         self._grasp_retries:  int = 0
+
+        self._pending_future = None   # async /plan_to_target future
 
         # ── State machine ────────────────────────────────────────────────────
         self.state       = State.INIT
@@ -185,6 +196,7 @@ class Task2Node(Node):
 
         self.get_logger().info('=' * 60)
         self.get_logger().info(f'Task 2: Pick [{self.block_color}] block → [{self.bin_color}] bin')
+        self.get_logger().info(f'Arm: {self.arm_name}')
         self.get_logger().info('Waiting for vision nodes …')
         self.get_logger().info('=' * 60)
 
@@ -201,12 +213,6 @@ class Task2Node(Node):
     def _object_pose_cb(self, msg: PoseStamped):
         self.object_pose   = msg
         self.pose_timestamp = time.time()
-
-    def _grasp_result_cb(self, msg: Bool):
-        self.grasp_result = msg.data
-
-    def _place_result_cb(self, msg: Bool):
-        self.place_result = msg.data
 
     # =========================================================================
     # Helpers
@@ -247,6 +253,7 @@ class Task2Node(Node):
         self.get_logger().info(f'[State] {self.state.name} → {new_state.name}')
         self.state       = new_state
         self.state_start = time.time()
+        self._pending_future = None   # clear any pending service call on transition
 
     def _elapsed(self) -> float:
         return time.time() - self.state_start
@@ -285,6 +292,29 @@ class Task2Node(Node):
         out.pose.orientation.w = float(qb[3])
         return out
 
+    def _call_plan_to_target(self, pose_base: PoseStamped,
+                              duration: float = 5.0) -> bool:
+        """
+        Build and send an async /plan_to_target request.
+        Returns True if the request was sent, False if the service isn't ready.
+        """
+        if not self.plan_client.service_is_ready():
+            self.get_logger().warn(
+                'Waiting for /plan_to_target service …',
+                throttle_duration_sec=1.0)
+            return False
+
+        req = PlanToTarget.Request()
+        req.arm_name             = self.arm_name
+        req.target_pose          = pose_base.pose
+        req.use_orientation      = True
+        req.max_condition_number = 100.0
+        req.execute              = True
+        req.duration             = duration
+
+        self._pending_future = self.plan_client.call_async(req)
+        return True
+
     # =========================================================================
     # Shared sub-behaviours
     # =========================================================================
@@ -310,16 +340,11 @@ class Task2Node(Node):
             self._spin()
 
     def _do_approach(self, find_state: State, tilt_state: State):
-        """Generic approach logic: drive forward while correcting heading.
-
-        Returns to find_state if drift is too large.
-        Advances to tilt_state when close enough.
-        """
+        """Generic approach logic: drive forward while correcting heading."""
         mc   = self.mask_center
         dist = self.object_distance
 
         if mc is None:
-            # Lost the object — stop and re-search
             self._stop()
             self.get_logger().warn('Object lost during approach – re-searching')
             self._transition(find_state)
@@ -327,7 +352,6 @@ class Task2Node(Node):
 
         h_err = mc.x - CENTER_X
 
-        # Re-centre if heading has drifted
         if abs(h_err) > RECENTER_TOL:
             self._stop()
             self.get_logger().warn(
@@ -335,7 +359,6 @@ class Task2Node(Node):
             self._transition(find_state)
             return
 
-        # Check distance
         if dist is not None:
             self.get_logger().info(
                 f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f} px',
@@ -358,14 +381,13 @@ class Task2Node(Node):
             return
 
         h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y   # positive → object below image centre
+        v_err = mc.y - CENTER_Y
 
         self.get_logger().info(
             f'[{self.state.name}] h_err={h_err:+.0f}  v_err={v_err:+.0f}  '
             f'tilt={self._cmd_tilt:.3f} rad',
             throttle_duration_sec=0.3)
 
-        # If the robot has drifted horizontally during tilt, go back to find
         if abs(h_err) > RECENTER_TOL:
             self.get_logger().warn(
                 f'Horizontal drift ({h_err:+.0f} px) during tilt – re-searching')
@@ -375,17 +397,16 @@ class Task2Node(Node):
         if abs(v_err) < VERTICAL_TOL:
             self.get_logger().info(
                 f'Object centred vertically (v_err={v_err:+.0f} px)')
-            self.pose_timestamp = None   # invalidate stale pose
+            self.pose_timestamp = None
             self._transition(next_state)
         else:
-            # Object below centre (v_err>0) → tilt down (negative)
             new_tilt = self._cmd_tilt - v_err * TILT_GAIN
             self._set_pan_tilt(self._cmd_pan, new_tilt)
 
     def _do_wait_pose(self, next_state: State):
         """Wait for simple_pose_fit to publish a pose after the robot is positioned."""
         if self._elapsed() < 0.3:
-            return  # stabilisation pause
+            return
 
         if (self.pose_timestamp is not None and
                 self.pose_timestamp >= self.state_start):
@@ -402,6 +423,76 @@ class Task2Node(Node):
             self.get_logger().info(
                 f'Waiting for pose … ({self._elapsed():.1f} / {POSE_WAIT_TIMEOUT:.0f} s)',
                 throttle_duration_sec=1.0)
+
+    def _do_plan_to_target(self, success_state: State, fail_state: State,
+                            retry_state: Optional[State] = None,
+                            max_retries: int = 0,
+                            retry_count_attr: str = ''):
+        """
+        Generic async /plan_to_target handler used by GRASP and PLACE.
+
+        On entry (pending_future is None): transform current object pose and
+        send service request.
+        While waiting: poll future.done(); enforce timeout.
+        On result: transition to success_state or fail_state.
+        """
+        elapsed = self._elapsed()
+
+        # ── Send request once on entry ────────────────────────────────────────
+        if self._pending_future is None and elapsed < 0.2:
+            pose_base = self._transform_to_base(self.object_pose)
+            if pose_base is None:
+                self.get_logger().error('TF transform failed')
+                self._transition(State.ERROR)
+                return
+
+            sent = self._call_plan_to_target(pose_base, duration=5.0)
+            if not sent:
+                return  # retry next tick
+
+            p = pose_base.pose.position
+            retries_str = ''
+            if retry_count_attr:
+                n = getattr(self, retry_count_attr, 0)
+                retries_str = f' (attempt {n + 1}/{max_retries})'
+            self.get_logger().info(
+                f'[{self.state.name}] Calling /plan_to_target{retries_str}: '
+                f'pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) m')
+            return
+
+        # ── Poll future ───────────────────────────────────────────────────────
+        if self._pending_future is not None:
+            if not self._pending_future.done():
+                if elapsed > RESULT_TIMEOUT:
+                    self.get_logger().error(
+                        f'[{self.state.name}] /plan_to_target timed out')
+                    self._pending_future = None
+                    self._transition(State.ERROR)
+                return
+
+            result = self._pending_future.result()
+            self._pending_future = None
+
+            if result.success:
+                self.get_logger().info(
+                    f'[{self.state.name}] Planning/execution succeeded: '
+                    f'{result.message}')
+                self._transition(success_state)
+            else:
+                self.get_logger().error(
+                    f'[{self.state.name}] Planning failed: {result.message}')
+                if retry_state is not None and retry_count_attr:
+                    retries = getattr(self, retry_count_attr, 0) + 1
+                    setattr(self, retry_count_attr, retries)
+                    if retries < max_retries:
+                        self.get_logger().warn(
+                            f'Retrying ({retries}/{max_retries}) …')
+                        self.pose_timestamp = None
+                        self._transition(retry_state)
+                        return
+                    self.get_logger().error(
+                        f'Failed after {max_retries} attempts')
+                self._transition(fail_state)
 
     # =========================================================================
     # State machine
@@ -443,48 +534,18 @@ class Task2Node(Node):
 
         # ── GRASP ─────────────────────────────────────────────────────────────
         elif self.state == State.GRASP:
-            if elapsed < 0.1:
-                # Transform and publish grasp target once on entry
-                pose_base = self._transform_to_base(self.object_pose)
-                if pose_base is None:
-                    self.get_logger().error('TF transform failed for grasp pose')
-                    self._transition(State.ERROR)
-                    return
-
-                self.grasp_result = None   # clear previous result
-                self.grasp_pub.publish(pose_base)
-
-                p = pose_base.pose.position
-                self.get_logger().info(
-                    f'Grasp target sent (attempt {self._grasp_retries + 1}/'
-                    f'{MAX_GRASP_RETRIES}): '
-                    f'pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) m')
-
-            # Wait for manipulation result
-            if self.grasp_result is None:
-                if elapsed > RESULT_TIMEOUT:
-                    self.get_logger().error('Grasp result timed out')
-                    self._transition(State.ERROR)
-                return
-
-            if self.grasp_result:
-                self.get_logger().info('Grasp SUCCESS → searching for bin')
+            self._do_plan_to_target(
+                success_state=State.FIND_BIN,
+                fail_state=State.ERROR,
+                retry_state=State.WAIT_BLOCK_POSE,
+                max_retries=MAX_GRASP_RETRIES,
+                retry_count_attr='_grasp_retries',
+            )
+            # On grasp success, switch vision to bin color and reset camera
+            if self.state == State.FIND_BIN:
                 self._grasp_retries = 0
-                self._set_pan_tilt(0.0, 0.0)          # reset camera
-                self._set_target_color(self.bin_color) # switch vision to bin color
-                self._transition(State.FIND_BIN)
-            else:
-                self._grasp_retries += 1
-                if self._grasp_retries >= MAX_GRASP_RETRIES:
-                    self.get_logger().error(
-                        f'Grasp failed after {MAX_GRASP_RETRIES} attempts')
-                    self._transition(State.ERROR)
-                else:
-                    self.get_logger().warn(
-                        f'Grasp FAILED – retrying pose estimation '
-                        f'({self._grasp_retries}/{MAX_GRASP_RETRIES})')
-                    self.pose_timestamp = None  # force fresh pose
-                    self._transition(State.WAIT_BLOCK_POSE)
+                self._set_pan_tilt(0.0, 0.0)
+                self._set_target_color(self.bin_color)
 
         # ── FIND_BIN ──────────────────────────────────────────────────────────
         elif self.state == State.FIND_BIN:
@@ -506,32 +567,10 @@ class Task2Node(Node):
 
         # ── PLACE ─────────────────────────────────────────────────────────────
         elif self.state == State.PLACE:
-            if elapsed < 0.1:
-                pose_base = self._transform_to_base(self.object_pose)
-                if pose_base is None:
-                    self.get_logger().error('TF transform failed for place pose')
-                    self._transition(State.ERROR)
-                    return
-
-                self.place_result = None
-                self.place_pub.publish(pose_base)
-
-                p = pose_base.pose.position
-                self.get_logger().info(
-                    f'Place target sent: pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) m')
-
-            if self.place_result is None:
-                if elapsed > RESULT_TIMEOUT:
-                    self.get_logger().error('Place result timed out')
-                    self._transition(State.ERROR)
-                return
-
-            if self.place_result:
-                self.get_logger().info('Place SUCCESS')
-                self._transition(State.DONE)
-            else:
-                self.get_logger().error('Place FAILED')
-                self._transition(State.ERROR)
+            self._do_plan_to_target(
+                success_state=State.DONE,
+                fail_state=State.ERROR,
+            )
 
         # ── DONE ─────────────────────────────────────────────────────────────
         elif self.state == State.DONE:
@@ -555,8 +594,10 @@ class Task2Node(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Task2Node()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
