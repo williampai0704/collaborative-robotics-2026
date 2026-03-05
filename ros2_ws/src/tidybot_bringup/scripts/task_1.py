@@ -85,7 +85,7 @@ TILT_MAX  =  0.5       # rad  (tilt up)
 # How long to wait for a fresh /object_pose after stopping
 POSE_WAIT_TIMEOUT = 8.0   # s
 SETTLE_TIME       = 2.0   # s — wait for robot to stop moving before accepting poses
-NUM_POSE_SAMPLES  = 5     # number of pose samples to average
+NUM_POSE_SAMPLES  = 10   # number of pose samples to average
 
 # How long to wait for /plan_to_target service result (includes execution time)
 RESULT_TIMEOUT = 30.0   # s
@@ -276,7 +276,7 @@ class Task1Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(P_base[0, 3]) - 0.01
+        out.pose.position.x = float(P_base[0, 3]) - 0.015
         out.pose.position.y = float(P_base[1, 3]) - 0.025
         out.pose.position.z = float(P_base[2, 3])
         qb = ScipyRotation.from_matrix(P_base[:3, :3]).as_quat()
