@@ -13,7 +13,7 @@ Services:
 import numpy as np
 from pathlib import Path
 from threading import Lock
-import threading  # [MODIFIED] Added threading module to prevent ROS 2 executor blocking
+import threading  # Added threading module to prevent ROS 2 executor blocking
 import subprocess
 import time
 from ament_index_python.packages import get_package_share_directory
@@ -29,6 +29,9 @@ from visualization_msgs.msg import Marker
 
 from interbotix_xs_msgs.msg import JointGroupCommand
 from tidybot_msgs.srv import PlanToTarget
+from tidybot_control.gripper_controller import GripperController
+
+# [NEW] Import the GripperController
 from tidybot_control.gripper_controller import GripperController
 
 
@@ -73,6 +76,9 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('workspace_min', [-0.2, -0.5, 0.0])
         self.declare_parameter('workspace_max', [0.8, 0.5, 0.8])
         self.declare_parameter('workspace_frame', 'base_link')
+        
+        # [NEW] Declare gripper mode parameter (default 'sim' matches your real.launch.py use_sim_topics:=true)
+        self.declare_parameter('gripper_mode', 'sim')
 
         # Retrieve parameters
         urdf_path_param = self.get_parameter('urdf_path').get_parameter_value().string_value
@@ -83,6 +89,8 @@ class MotionPlannerRealNode(Node):
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
         self.ik_damping = self.get_parameter('ik_damping').get_parameter_value().double_value
         self.max_ik_seeds = self.get_parameter('max_ik_seeds').get_parameter_value().integer_value
+        
+        gripper_mode = self.get_parameter('gripper_mode').get_parameter_value().string_value
 
         self.workspace_min = np.array(self.get_parameter('workspace_min').get_parameter_value().double_array_value)
         self.workspace_max = np.array(self.get_parameter('workspace_max').get_parameter_value().double_array_value)
@@ -172,6 +180,9 @@ class MotionPlannerRealNode(Node):
             'right': self.create_publisher(JointGroupCommand, '/right_arm/commands/joint_group', 10),
             'left': self.create_publisher(JointGroupCommand, '/left_arm/commands/joint_group', 10),
         }
+        
+        # [NEW] Initialize Gripper Controller
+        self.gripper = GripperController(self, mode=gripper_mode)
 
         self.workspace_marker_pub = self.create_publisher(Marker, 'workspace_marker', 10)
         self.create_timer(0.5, self.safety_timer_callback)
@@ -186,7 +197,7 @@ class MotionPlannerRealNode(Node):
 
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
-        self.get_logger().info('Motion planner (real hardware) initialized with 2-step Hover & Descend logic.')
+        self.get_logger().info('Motion planner (real hardware) initialized with Hover, Descend, and Grasp logic.')
 
     def _process_xacro(self, xacro_path: Path) -> str:
         if xacro_path.suffix == '.xacro':
@@ -342,9 +353,7 @@ class MotionPlannerRealNode(Node):
 
         return min_distance >= self.min_collision_distance, min_distance
 
-    # [NEW] Path validation helper (extracted for clean reuse in 2-step planning)
     def _validate_path(self, arm_name: str, start_q: np.ndarray, goal_q: np.ndarray, other_arm_q: np.ndarray, steps: int = 20) -> tuple:
-        """Interpolates between start and goal joint positions and checks for collisions."""
         for i in range(1, steps + 1):
             alpha = i / steps
             interp_q = (1 - alpha) * start_q + alpha * goal_q
@@ -359,11 +368,6 @@ class MotionPlannerRealNode(Node):
         return True, 1.0
 
     def plan_to_target_callback(self, request, response):
-        """
-        [MODIFIED] 2-Step Sequence Planner embedded in the service.
-        Automatically calculates a hover position (z=0.5), validates it,
-        calculates the descent path, and if both are safe, executes the sequence.
-        """
         arm_name = request.arm_name.lower()
         if arm_name not in ['right', 'left']:
             response.success, response.message = False, "Invalid arm_name."
@@ -427,8 +431,6 @@ class MotionPlannerRealNode(Node):
         # PHASE 2: Plan to Descend (Final Target)
         # =========================================================
         self.get_logger().info(f'Phase 2: Planning descend to target (z={final_target_se3.translation[2]:.3f})')
-        # [KEY LOGIC] Use hover_solution as the ONLY seed. This guarantees the robot
-        # reaches straight down without twisting elbows or flipping configurations.
         ik_success, final_solution, final_pos_err, final_ori_err = self.solve_ik(
             arm_name, final_target_se3, request.use_orientation, hover_solution
         )
@@ -438,7 +440,7 @@ class MotionPlannerRealNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        # Check Singularity for both solutions
+        # Check Singularity
         cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
         cond_final = self.compute_jacobian_condition(arm_name, final_solution)
         max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 100.0
@@ -451,21 +453,18 @@ class MotionPlannerRealNode(Node):
         # =========================================================
         # PHASE 3: Path Validation (Collisions)
         # =========================================================
-        # Path 1: Current -> Hover
         free_1, min_dist_1 = self._validate_path(arm_name, primary_seed, hover_solution, other_arm_positions)
         if not free_1:
             response.success, response.message = False, f"Collision in Hover path: min_dist={min_dist_1:.3f}m"
             self.get_logger().warn(response.message)
             return response
 
-        # Path 2: Hover -> Final Target
         free_2, min_dist_2 = self._validate_path(arm_name, hover_solution, final_solution, other_arm_positions)
         if not free_2:
             response.success, response.message = False, f"Collision in Descend path: min_dist={min_dist_2:.3f}m"
             self.get_logger().warn(response.message)
             return response
 
-        # All checks passed!
         response.success = True
         response.message = f"2-Step Planning successful. Hover_err={hover_pos_err:.4f}m, Final_err={final_pos_err:.4f}m"
         response.position_error = final_pos_err
@@ -494,7 +493,6 @@ class MotionPlannerRealNode(Node):
 
         return response
 
-    # [NEW] Helper function to execute a single motion segment
     def _execute_motion_step(self, arm_name: str, start_q: np.ndarray, target_q: np.ndarray, duration: float):
         rate_hz, dt = 50.0, 1.0 / 50.0
         num_steps = max(int(duration * rate_hz), 1)
@@ -666,4 +664,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
