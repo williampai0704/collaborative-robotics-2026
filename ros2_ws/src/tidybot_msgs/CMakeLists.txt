@@ -18,6 +18,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CartesianVelocityCommand.msg"
   "msg/GripperCommand.msg"
   "msg/PanTilt.msg"
+  "msg/SpeechExtraction.msg"
   "srv/SolveIK.srv"
   "srv/GetJointState.srv"
   "srv/PlanToTarget.srv"

@@ -40,6 +40,8 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  scripts/speech/speech_extraction_node.py
+  scripts/speech/gemini.py
   scripts/combined_arm_motion_with_grasping.py
   scripts/combined_arm_motion_with_grasping_real.py
   scripts/ee_trajectory_plotter.py
