@@ -24,7 +24,7 @@ Orchestrates the existing motion and vision modules via ROS2 topics:
     Calls      : /plan_to_target    — motion planner service (PlanToTarget)
 
 Pipeline (state machine):
-  INIT → SPINNING → TILT_ADJUST → WAIT_POSE → SEND_TO_MANIPULATION → DONE
+  INIT → SPINNING → WAIT_POSE → SEND_TO_MANIPULATION → DONE
 
 Usage:
     # Terminal 1 – motion module
@@ -95,7 +95,6 @@ RESULT_TIMEOUT = 30.0   # s
 class State(Enum):
     INIT                 = auto()  # wait for first /mask_center message
     SPINNING             = auto()  # command motion module to spin; watch mask centre
-    TILT_ADJUST          = auto()  # stop base, adjust camera tilt for vertical centre
     WAIT_POSE            = auto()  # wait for a fresh /object_pose from simple_pose_fit
     SEND_TO_MANIPULATION = auto()  # call /plan_to_target with pose in base_link
     DONE                 = auto()
@@ -292,44 +291,8 @@ class Task1Node(Node):
                 self._stop_motion()
                 self.get_logger().info(
                     f'Horizontally centred (cx={mc.x:.0f}, err={h_err:+.0f} px)')
-                self._transition(State.TILT_ADJUST)
-
-        # ── TILT_ADJUST ───────────────────────────────────────────────────────
-        # Adjust camera tilt so the object is also vertically centred.
-        elif self.state == State.TILT_ADJUST:
-            mc = self.mask_center
-            if mc is None:
-                self.get_logger().warn('Object lost during tilt adjust – resuming spin')
-                self._transition(State.SPINNING)
-                return
-
-            h_err = mc.x - CENTER_X
-            v_err = mc.y - CENTER_Y   # positive → object below image centre
-
-            self.get_logger().info(
-                f'[TILT] cx={mc.x:.0f} cy={mc.y:.0f}  '
-                f'h_err={h_err:+.0f}  v_err={v_err:+.0f}  '
-                f'tilt={self._cmd_tilt:.3f} rad',
-                throttle_duration_sec=0.3,
-            )
-
-            # If horizontal has drifted too far, go back to spinning
-            if abs(h_err) > HORIZONTAL_TOL * 2:
-                self.get_logger().warn(
-                    f'Horizontal drift ({h_err:+.0f} px) – resuming spin')
-                self._transition(State.SPINNING)
-                return
-
-            if abs(v_err) < VERTICAL_TOL:
-                self.get_logger().info(
-                    f'Object centred in camera view (v_err={v_err:+.0f} px)')
-                # Invalidate any stale pose so we wait for a fresh one
                 self.pose_timestamp = None
                 self._transition(State.WAIT_POSE)
-            else:
-                # Negative coefficient: object below centre (v_err>0) → tilt down (−)
-                new_tilt = self._cmd_tilt - v_err * TILT_GAIN
-                self._set_pan_tilt(self._cmd_pan, new_tilt)
 
         # ── WAIT_POSE ─────────────────────────────────────────────────────────
         # Wait for simple_pose_fit to publish a fresh pose now that the object
