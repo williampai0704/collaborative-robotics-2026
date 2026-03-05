@@ -534,30 +534,85 @@ class MotionPlannerRealNode(Node):
         arm = arm_name.upper()
 
         if mode == 'pick':
+            # Step 1 : Open left gripper
             log.info(f'[{arm}] PICK: opening left gripper...')
             self.left_gripper.open('left', duration=2.0)
 
-        log.info(f'[{arm}] Moving to hover...')
-        self._execute_motion_step(arm_name, start_q, hover_q, duration)
+            # Step 2.1 : Move arm : start -> hover
+            log.info(f'[{arm}] Moving to hover...')
+            self._execute_motion_step(arm_name, start_q, hover_q, duration)
 
-        log.info(f'[{arm}] Descending to target...')
-        self._execute_motion_step(arm_name, hover_q, final_q, duration)
+            # Step 2.2 : Move arm : hover -> target
+            log.info(f'[{arm}] Descending to target...')
+            self._execute_motion_step(arm_name, hover_q, final_q, duration)
 
-        if mode == 'pick':
+            # Step 3 : Close left gripper
             log.info(f'[{arm}] PICK: closing left gripper...')
             self.left_gripper.close('left', duration=3.0)
-        else:  # place
+
+            # Step 4 : Return arm : target -> hover
+            log.info(f'[{arm}] Returning to hover...')
+            self._execute_motion_step(arm_name, final_q, hover_q, duration)
+
+            # Step 5 : Check grasp
+            grasped = self.left_gripper.check_grasp('left')
+            log.info(f'[LEFT GRIPPER] check_grasp={grasped} '
+                        f'(pick expects True, place expects False)')
+        
+        elif mode == 'place':
+            # Step 1 : Move arm : hover -> target (gripper already closed from pick)
+            log.info(f'[{arm}] Moving to hover...')
+            self._execute_motion_step(arm_name, hover_q, final_q, duration)
+
+            # Step 2 : Open left gripper
             log.info(f'[{arm}] PLACE: opening left gripper...')
             self.left_gripper.open('left', duration=2.0)
 
-        log.info(f'[{arm}] Returning to start...')
-        self._execute_motion_step(arm_name, final_q, hover_q, duration)
-        self._execute_motion_step(arm_name, hover_q, start_q, duration)
+            # Step 3.1 : Return arm : target -> hover
+            log.info(f'[{arm}] Returning to hover...')
+            self._execute_motion_step(arm_name, final_q, hover_q, duration)
 
-        grasped = self.left_gripper.check_grasp('left')
-        log.info(f'[LEFT GRIPPER] check_grasp={grasped}  '
-                 f'(pick expects True, place expects False)')
+            # Step 3.2 : Return arm : hover -> start
+            log.info(f'[{arm}] Returning to start...')
+            self._execute_motion_step(arm_name, hover_q, start_q, duration)
+
+            # Step 4 : Check grasp
+            grasped = self.left_gripper.check_grasp('left')
+            log.info(f'[LEFT GRIPPER] check_grasp={grasped} '
+                        f'(pick expects True, place expects False)')
+    
+
+        else:
+            log.error(f'Unknown mode "{mode}" in execute_sequence. No action taken.')
+            
         return grasped
+
+
+        # if mode == 'pick':
+        #     log.info(f'[{arm}] PICK: opening left gripper...')
+        #     self.left_gripper.open('left', duration=2.0)
+
+        # log.info(f'[{arm}] Moving to hover...')
+        # self._execute_motion_step(arm_name, start_q, hover_q, duration)
+
+        # log.info(f'[{arm}] Descending to target...')
+        # self._execute_motion_step(arm_name, hover_q, final_q, duration)
+
+        # if mode == 'pick':
+        #     log.info(f'[{arm}] PICK: closing left gripper...')
+        #     self.left_gripper.close('left', duration=3.0)
+        # else:  # place
+        #     log.info(f'[{arm}] PLACE: opening left gripper...')
+        #     self.left_gripper.open('left', duration=2.0)
+
+        # log.info(f'[{arm}] Returning to start...')
+        # self._execute_motion_step(arm_name, final_q, hover_q, duration)
+        # self._execute_motion_step(arm_name, hover_q, start_q, duration)
+
+        # grasped = self.left_gripper.check_grasp('left')
+        # log.info(f'[LEFT GRIPPER] check_grasp={grasped}  '
+        #          f'(pick expects True, place expects False)')
+        # return grasped
 
     def publish_workspace_marker(self):
         marker = Marker()
