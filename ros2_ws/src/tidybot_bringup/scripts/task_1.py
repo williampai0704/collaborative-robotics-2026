@@ -155,7 +155,7 @@ class Task1Node(Node):
         self._pending_future = None   # async service call future
 
         # ── State machine ────────────────────────────────────────────────────
-        self.state       = State.INIT
+        self.state       = State.SPINNING
         self.state_start = time.time()
 
         self.create_timer(0.05, self._loop)   # 20 Hz control loop

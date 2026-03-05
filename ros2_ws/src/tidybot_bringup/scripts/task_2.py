@@ -101,8 +101,8 @@ HORIZONTAL_TOL  = 50    # px  — stop spinning: |cx − CENTER_X| < this
 RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
 VERTICAL_TOL    = 60    # px  — stop tilting: |cy − CENTER_Y| < this
 
-APPROACH_DIST   = 0.35  # m   — stop driving when object is this close
-APPROACH_SPEED  = 0.12  # m/s — forward speed during approach
+APPROACH_DIST   = 0.50  # m   — stop driving when object is this close
+APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
 SPIN_SPEED      = 0.3   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
@@ -189,7 +189,7 @@ class Task2Node(Node):
         self._pending_future = None   # async /plan_to_target future
 
         # ── State machine ────────────────────────────────────────────────────
-        self.state       = State.INIT
+        self.state       = State.FIND_BLOCK
         self.state_start = time.time()
 
         self.create_timer(0.05, self._loop)  # 20 Hz
