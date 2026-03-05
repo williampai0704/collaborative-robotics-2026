@@ -257,9 +257,10 @@ class GripperController:
             self.node.get_logger().warn(f"Invalid side '{side}' for check_grasp")
             return False
 
-        # Spin briefly to ensure we have fresh joint state data
-        for _ in range(20):
-            rclpy.spin_once(self.node, timeout_sec=0.02)
+        # Wait briefly to ensure we have fresh joint state data.
+        # Use sleep rather than spin_once so this is safe when the node is
+        # already managed by an executor (e.g. MultiThreadedExecutor).
+        time.sleep(0.4)
 
         # Debug: show all stored finger positions
         self.node.get_logger().info(

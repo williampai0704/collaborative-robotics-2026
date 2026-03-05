@@ -22,12 +22,14 @@ import pinocchio as pin
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import Pose
 from visualization_msgs.msg import Marker
 
 from interbotix_xs_msgs.msg import JointGroupCommand
 from tidybot_msgs.srv import PlanToTarget
+from tidybot_control.gripper_controller import GripperController
 
 
 class MotionPlannerRealNode(Node):
@@ -178,6 +180,9 @@ class MotionPlannerRealNode(Node):
         self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
         self.create_subscription(JointState, '/right_arm/joint_states', self.joint_state_callback, 10)
         self.create_subscription(JointState, '/left_arm/joint_states', self.joint_state_callback, 10)
+
+        # Gripper controller for grasp-after-descend (SDK mode, left arm)
+        self.left_gripper = GripperController(self, mode='sdk')
 
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
@@ -364,7 +369,14 @@ class MotionPlannerRealNode(Node):
             response.success, response.message = False, "Invalid arm_name."
             return response
 
-        self.get_logger().info(f'Starting 2-Step Planning for {arm_name} arm...')
+        mode = request.mode.lower() if hasattr(request, 'mode') else 'pick'
+        if mode not in ('pick', 'place'):
+            response.success, response.message = False, f"Invalid mode '{mode}'. Use 'pick' or 'place'."
+            return response
+
+        self.get_logger().info(f'Starting 2-Step Planning for {arm_name} arm (mode={mode})...')
+        # Capture starting joint positions before any motion
+        start_q = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
         primary_seed = self.get_arm_joint_positions(arm_name)
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
@@ -461,17 +473,24 @@ class MotionPlannerRealNode(Node):
         response.joint_positions = final_solution.tolist()
 
         if request.execute:
-            # Spawn sequence thread
-            exec_thread = threading.Thread(
-                target=self.execute_sequence,
-                args=(arm_name, hover_solution, final_solution, request.duration),
-                daemon=True
-            )
+            # Run sequence in a thread so we can join it without blocking the executor's
+            # main spin loop (requires MultiThreadedExecutor in main()).
+            grasp_result = [False]
+
+            def _run():
+                grasp_result[0] = self.execute_sequence(
+                    arm_name, hover_solution, final_solution, start_q, request.duration, mode
+                )
+
+            exec_thread = threading.Thread(target=_run, daemon=True)
             exec_thread.start()
+            exec_thread.join()  # Block this service callback until sequence + grasp done
             response.executed = True
-            self.get_logger().info(f'Starting sequence execution in background thread.')
+            response.grasped = grasp_result[0]
+            self.get_logger().info(f'Execution complete. grasped={response.grasped}')
         else:
             response.executed = False
+            response.grasped = False
 
         return response
 
@@ -493,23 +512,52 @@ class MotionPlannerRealNode(Node):
             if i < num_steps: 
                 time.sleep(dt)
 
-    # [NEW] Method to execute the 2-step sequence (Hover -> Wait -> Descend)
-    def execute_sequence(self, arm_name: str, hover_q: np.ndarray, final_q: np.ndarray, duration: float):
-        """Executes the full trajectory: Move to Hover -> Wait 5s -> Move to Target."""
-        # 1. Move to Hover
-        self.get_logger().info(f'[{arm_name.upper()} ARM] Step 1: Moving to hover (z=0.5) over {duration}s...')
-        current_q = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
-        self._execute_motion_step(arm_name, current_q, hover_q, duration)
+    def execute_sequence(self, arm_name: str, hover_q: np.ndarray, final_q: np.ndarray,
+                         start_q: np.ndarray, duration: float, mode: str) -> bool:
+        """
+        Execute pick or place sequence and return grasp-check result.
 
-        # 2. Wait 5 Seconds
-        self.get_logger().info(f'[{arm_name.upper()} ARM] Hover reached. Waiting for 5.0 seconds...')
-        time.sleep(5.0)
+        pick:
+            1. Open left gripper
+            2. Move arm: start -> hover -> target
+            3. Close left gripper
+            4. Return arm: target -> hover -> start
+            5. Check grasp  (True = holding object)
 
-        # 3. Descend to Final Target
-        self.get_logger().info(f'[{arm_name.upper()} ARM] Step 2: Descending to final target over {duration}s...')
+        place:
+            1. Move arm: start -> hover -> target  (gripper already closed)
+            2. Open left gripper
+            3. Return arm: target -> hover -> start
+            4. Check grasp  (False = released successfully)
+        """
+        log = self.get_logger()
+        arm = arm_name.upper()
+
+        if mode == 'pick':
+            log.info(f'[{arm}] PICK: opening left gripper...')
+            self.left_gripper.open('left', duration=2.0)
+
+        log.info(f'[{arm}] Moving to hover...')
+        self._execute_motion_step(arm_name, start_q, hover_q, duration)
+
+        log.info(f'[{arm}] Descending to target...')
         self._execute_motion_step(arm_name, hover_q, final_q, duration)
-        
-        self.get_logger().info(f'[{arm_name.upper()} ARM] 🟢 Sequence successfully completed!')
+
+        if mode == 'pick':
+            log.info(f'[{arm}] PICK: closing left gripper...')
+            self.left_gripper.close('left', duration=3.0)
+        else:  # place
+            log.info(f'[{arm}] PLACE: opening left gripper...')
+            self.left_gripper.open('left', duration=2.0)
+
+        log.info(f'[{arm}] Returning to start...')
+        self._execute_motion_step(arm_name, final_q, hover_q, duration)
+        self._execute_motion_step(arm_name, hover_q, start_q, duration)
+
+        grasped = self.left_gripper.check_grasp('left')
+        log.info(f'[LEFT GRIPPER] check_grasp={grasped}  '
+                 f'(pick expects True, place expects False)')
+        return grasped
 
     def publish_workspace_marker(self):
         marker = Marker()
@@ -549,8 +597,14 @@ class MotionPlannerRealNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MotionPlannerRealNode()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
+    # MultiThreadedExecutor lets service callbacks block (for join()) without
+    # starving joint-state subscriptions that feed grasp detection.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()

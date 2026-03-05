@@ -4,6 +4,11 @@
 # Which arm to move: "right" or "left"
 string arm_name
 
+# Operation mode: "pick" or "place"
+#   "pick"  - open gripper -> move to target -> close gripper -> return home -> check grasp
+#   "place" - move to target (gripper already closed) -> open gripper -> return home -> check grasp
+string mode "pick"
+
 # Target end-effector pose in base_link frame
 geometry_msgs/Pose target_pose
 
@@ -43,3 +48,7 @@ float64 condition_number
 
 # Detailed status message
 string message
+
+# Whether the left gripper successfully grasped an object after reaching the target
+# Only meaningful when execute=true; False if execution was skipped or grasp check failed
+bool grasped
