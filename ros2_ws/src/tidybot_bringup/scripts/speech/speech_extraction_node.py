@@ -2,43 +2,59 @@
 """
 Speech Extraction Node
 
-ROS2 node that reads an m4a audio file, transcribes it using Google Cloud Speech-to-Text,
-extracts object and bin colors using Gemini, and publishes the result to a topic.
+ROS2 node that records from the robot microphone (or reads an m4a file),
+transcribes with Google Cloud Speech-to-Text, extracts object/bin colors
+using Gemini, and publishes the result to /speech_extraction.
 
-Topics published:
-- /speech_extraction (SpeechExtraction) - extracted object_color and bin_color
+─── Modes ─────────────────────────────────────────────────────────────────────
+Mic mode (default):
+    Records from the robot microphone via /microphone/record service.
+    Requires the microphone_node to be running (launched by real.launch.py).
 
-Parameters:
-- audio_file_path: Path to the m4a audio file to process
-- google_api_key: Google API key for Gemini (or set GOOGLE_API_KEY env var)
-- json_key_path: Path to Google Cloud service account JSON key file
+File mode:
+    Reads a pre-recorded m4a file instead of live mic input.
 
-Usage:
-    # Set up credentials (choose one method):
-    # Method 1: Environment variable
-    export GOOGLE_API_KEY="your-api-key"
-    export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+─── Prerequisites ──────────────────────────────────────────────────────────────
+1. Google credentials (choose one):
+       export GOOGLE_API_KEY="your-api-key"
+       export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+   OR place key at:
+       ros2_ws/src/tidybot_bringup/config/credentials/google_cloud_key.json
 
-    # Method 2: Use config file location
-    # Place your service account JSON at: ros2_ws/src/tidybot_bringup/config/credentials/google_cloud_key.json
+2. Real robot launch (for mic mode):
+       ros2 launch tidybot_bringup real.launch.py
 
-    # Run the node
-    ros2 run tidybot_bringup speech_extraction_node.py --ros-args \
-        -p audio_file_path:=/path/to/audio.m4a
+─── Usage ──────────────────────────────────────────────────────────────────────
+Mic mode (default, 5-second recording):
+    ros2 run tidybot_bringup speech_extraction_node.py
+
+Mic mode with custom duration:
+    ros2 run tidybot_bringup speech_extraction_node.py \
+        --ros-args -p record_duration:=7.0
+
+File mode:
+    ros2 run tidybot_bringup speech_extraction_node.py \
+        --ros-args -p use_mic:=false -p audio_file_path:=/path/to/audio.m4a
 """
 
 import os
 import io
 import re
 import json
+import wave
+import threading
+import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from ament_index_python.packages import get_package_share_directory
 
 from google.cloud import speech
 from pydub import AudioSegment
 
 from tidybot_msgs.msg import SpeechExtraction
+from tidybot_msgs.srv import AudioRecord
 from std_msgs.msg import Header
 
 # Import local gemini module
@@ -104,12 +120,16 @@ class SpeechExtractionNode(Node):
         super().__init__('speech_extraction_node')
 
         # Declare parameters
+        self.declare_parameter('use_mic', True)
+        self.declare_parameter('record_duration', 5.0)
         self.declare_parameter('audio_file_path', '')
         self.declare_parameter('google_api_key', '')
         self.declare_parameter('json_key_path', '')
-        self.declare_parameter('publish_rate', 1.0)  # Hz, how often to check for new audio
+        self.declare_parameter('publish_rate', 1.0)
 
         # Get parameters
+        self.use_mic = self.get_parameter('use_mic').get_parameter_value().bool_value
+        self.record_duration = self.get_parameter('record_duration').get_parameter_value().double_value
         self.audio_file_path = self.get_parameter('audio_file_path').get_parameter_value().string_value
         google_api_key = self.get_parameter('google_api_key').get_parameter_value().string_value
         json_key_path = self.get_parameter('json_key_path').get_parameter_value().string_value
@@ -149,17 +169,101 @@ class SpeechExtractionNode(Node):
             self.get_logger().error(f'Failed to initialize Gemini: {e}')
             self.gemini = None
 
-        # Process audio file if provided
-        if self.audio_file_path:
-            self.get_logger().info(f'Processing audio file: {self.audio_file_path}')
+        # Event-based sync helpers for async service calls from background thread
+        self._mic_result = None
+        self._mic_event = threading.Event()
+
+        if self.use_mic:
+            # Mic client — give the service 2 s to come up before recording
+            self._mic_cb_group = MutuallyExclusiveCallbackGroup()
+            self.mic_client = self.create_client(
+                AudioRecord, '/microphone/record',
+                callback_group=self._mic_cb_group
+            )
+            self.get_logger().info(
+                f'Mic mode: will record {self.record_duration:.1f}s from /microphone/record')
+            self.create_timer(2.0, self._trigger_mic_recording)
+        elif self.audio_file_path:
+            self.get_logger().info(f'File mode: processing {self.audio_file_path}')
             self.process_audio_file(self.audio_file_path)
         else:
-            self.get_logger().info('No audio file path provided. Waiting for service calls...')
+            self.get_logger().warn('No mic and no audio_file_path — nothing to process.')
 
         self.get_logger().info('=' * 50)
         self.get_logger().info('Speech Extraction Node Ready')
-        self.get_logger().info('Listening on topic: /speech_extraction')
         self.get_logger().info('=' * 50)
+
+    def _trigger_mic_recording(self):
+        """Called once by a 2-second startup timer; runs mic I/O in a background thread."""
+        self.destroy_timer(self._trigger_mic_recording)
+        threading.Thread(target=self._mic_record_and_process, daemon=True).start()
+
+    def _call_mic_service(self, start: bool):
+        """
+        Call /microphone/record from a background thread.
+        Uses call_async + threading.Event so the main executor keeps spinning.
+        """
+        self._mic_event.clear()
+        self._mic_result = None
+
+        if not self.mic_client.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error('/microphone/record service not available')
+            return None
+
+        req = AudioRecord.Request()
+        req.start = start
+        future = self.mic_client.call_async(req)
+        future.add_done_callback(self._mic_done_cb)
+        self._mic_event.wait(timeout=30.0)
+        return self._mic_result
+
+    def _mic_done_cb(self, future):
+        self._mic_result = future.result()
+        self._mic_event.set()
+
+    @staticmethod
+    def _float32_to_wav(audio_data, sample_rate: int) -> bytes:
+        """Convert PCM float32 samples to 16-bit WAV bytes."""
+        audio = np.clip(np.array(audio_data, dtype=np.float32), -1.0, 1.0)
+        int16 = (audio * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'w') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(int16.tobytes())
+        buf.seek(0)
+        return buf.read()
+
+    def _mic_record_and_process(self):
+        """Background thread: start mic → sleep → stop mic → transcribe → publish."""
+        log = self.get_logger()
+
+        log.info('Starting microphone recording...')
+        resp_start = self._call_mic_service(start=True)
+        if resp_start is None or not resp_start.success:
+            err = resp_start.message if resp_start else 'service call failed'
+            log.error(f'Mic start failed: {err}')
+            return
+
+        log.info(f'Recording for {self.record_duration:.1f}s — speak now...')
+        threading.Event().wait(timeout=self.record_duration)   # interruptible sleep
+
+        log.info('Stopping microphone recording...')
+        resp_stop = self._call_mic_service(start=False)
+        if resp_stop is None or not resp_stop.success:
+            err = resp_stop.message if resp_stop else 'service call failed'
+            log.error(f'Mic stop failed: {err}')
+            return
+
+        if not resp_stop.audio_data:
+            log.error('Mic returned no audio data')
+            return
+
+        log.info(f'Got {len(resp_stop.audio_data)} samples @ {resp_stop.sample_rate} Hz '
+                 f'({resp_stop.duration:.2f}s) — transcribing...')
+        wav_bytes = self._float32_to_wav(resp_stop.audio_data, resp_stop.sample_rate)
+        self._transcribe_and_publish(wav_bytes)
 
     def _find_default_credentials(self):
         """Try to find credentials in default locations."""
@@ -232,25 +336,24 @@ class SpeechExtractionNode(Node):
             return 'unknown', 'unknown', False
 
     def process_audio_file(self, audio_path):
-        """
-        Process an audio file: transcribe and extract information.
+        """Process an m4a file: convert to WAV then transcribe and publish."""
+        if not os.path.exists(audio_path):
+            self.get_logger().error(f'Audio file not found: {audio_path}')
+            return
+        try:
+            self.get_logger().info('Converting audio file...')
+            wav_content = self.convert_m4a_to_wav(audio_path)
+            self._transcribe_and_publish(wav_content)
+        except Exception as e:
+            self.get_logger().error(f'Error processing audio file: {e}')
 
-        :param audio_path: Path to the audio file.
-        """
+    def _transcribe_and_publish(self, wav_bytes: bytes):
+        """Transcribe WAV bytes with Google STT + Gemini, then publish result."""
         msg = SpeechExtraction()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'speech'
 
-        # Check if file exists
-        if not os.path.exists(audio_path):
-            msg.success = False
-            msg.error_message = f'Audio file not found: {audio_path}'
-            self.extraction_pub.publish(msg)
-            self.get_logger().error(msg.error_message)
-            return
-
-        # Check if transcriber is available
         if self.transcriber is None:
             msg.success = False
             msg.error_message = 'Transcriber not initialized'
@@ -258,7 +361,6 @@ class SpeechExtractionNode(Node):
             self.get_logger().error(msg.error_message)
             return
 
-        # Check if Gemini is available
         if self.gemini is None:
             msg.success = False
             msg.error_message = 'Gemini not initialized'
@@ -267,13 +369,8 @@ class SpeechExtractionNode(Node):
             return
 
         try:
-            # Step 1: Convert audio to WAV
-            self.get_logger().info('Converting audio file...')
-            wav_content = self.convert_m4a_to_wav(audio_path)
-
-            # Step 2: Transcribe
             self.get_logger().info('Transcribing audio...')
-            transcription = self.transcriber.transcribe_audio(wav_content)
+            transcription = self.transcriber.transcribe_audio(wav_bytes)
             msg.transcription = transcription
             self.get_logger().info(f'Transcription: {transcription}')
 
@@ -284,28 +381,22 @@ class SpeechExtractionNode(Node):
                 self.get_logger().warn(msg.error_message)
                 return
 
-            # Step 3: Extract information using Gemini
             self.get_logger().info('Extracting information with Gemini...')
             gemini_response = self.gemini.generate_content(transcription, use_prompt=True)
             self.get_logger().info(f'Gemini response: {gemini_response}')
 
-            # Step 4: Parse response
             object_color, bin_color, success = self.parse_gemini_response(gemini_response)
-
             msg.object_color = object_color
             msg.bin_color = bin_color
             msg.success = success
 
             if success:
-                self.get_logger().info(f'Extracted: object_color={object_color}, bin_color={bin_color}')
+                self.get_logger().info(
+                    f'Extracted: object_color={object_color}, bin_color={bin_color}')
             else:
                 msg.error_message = 'Failed to parse Gemini response'
 
-            # Store result for continuous publishing
             self.last_extraction_msg = msg
-            self.get_logger().info('Publishing extraction result...')
-            
-            # Publish immediately and set up timer for repeated publishing
             self.extraction_pub.publish(msg)
             self.publish_count = 0
             self.publish_timer = self.create_timer(0.1, self._publish_result_callback)
@@ -314,7 +405,7 @@ class SpeechExtractionNode(Node):
             msg.success = False
             msg.error_message = str(e)
             self.extraction_pub.publish(msg)
-            self.get_logger().error(f'Error processing audio: {e}')
+            self.get_logger().error(f'Error during transcription/extraction: {e}')
 
     def _publish_result_callback(self):
         """Publish the extraction result multiple times to ensure delivery."""
@@ -329,9 +420,10 @@ class SpeechExtractionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = SpeechExtractionNode()
-
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

@@ -88,6 +88,9 @@ POSE_WAIT_TIMEOUT = 8.0   # s
 # How long to wait for /plan_to_target service result (includes execution time)
 RESULT_TIMEOUT = 30.0   # s
 
+MAX_GRASP_RETRIES = 3   # re-attempt pick if grasped=False
+GRASP_Z = 0.07          # fixed grasp height in base_link frame (m)
+
 # =============================================================================
 # States
 # =============================================================================
@@ -109,7 +112,7 @@ class Task1Node(Node):
         super().__init__('task_1')
 
         # ── Parameters ──────────────────────────────────────────────────────
-        self.declare_parameter('arm_name', 'right')
+        self.declare_parameter('arm_name', 'left')
         self.arm_name: str = self.get_parameter('arm_name').value
 
         # ── Callback groups ──────────────────────────────────────────────────
@@ -153,6 +156,7 @@ class Task1Node(Node):
         self._cmd_tilt: float = 0.0
 
         self._pending_future = None   # async service call future
+        self._grasp_retries  = 0
 
         # ── State machine ────────────────────────────────────────────────────
         self.state       = State.SPINNING
@@ -337,12 +341,14 @@ class Task1Node(Node):
                     return
 
                 req = PlanToTarget.Request()
-                req.arm_name          = self.arm_name
-                req.target_pose       = pose_base.pose
-                req.use_orientation   = True
+                req.arm_name             = self.arm_name
+                req.mode                 = 'pick'
+                req.target_pose          = pose_base.pose
+                req.target_pose.position.z = GRASP_Z
+                req.use_orientation      = True
                 req.max_condition_number = 100.0
-                req.execute           = True
-                req.duration          = 5.0
+                req.execute              = True
+                req.duration             = 5.0
 
                 self._pending_future = self.plan_client.call_async(req)
 
@@ -372,14 +378,27 @@ class Task1Node(Node):
                 result = self._pending_future.result()
                 self._pending_future = None
 
-                if result.success:
+                if result.success and result.grasped:
                     self.get_logger().info(
-                        f'Motion planning succeeded: {result.message}')
+                        f'Pick succeeded: {result.message}')
+                    self._grasp_retries = 0
+                    self._transition(State.DONE)
+                elif result.success and not result.grasped:
+                    self._grasp_retries += 1
+                    if self._grasp_retries < MAX_GRASP_RETRIES:
+                        self.get_logger().warn(
+                            f'Grasp failed (attempt {self._grasp_retries}/'
+                            f'{MAX_GRASP_RETRIES}) – retrying')
+                        self._transition(State.SEND_TO_MANIPULATION)
+                    else:
+                        self.get_logger().error(
+                            f'Grasp failed after {MAX_GRASP_RETRIES} attempts')
+                        self._grasp_retries = 0
+                        self._transition(State.DONE)
                 else:
                     self.get_logger().error(
                         f'Motion planning failed: {result.message}')
-
-                self._transition(State.DONE)
+                    self._transition(State.DONE)
 
         # ── DONE ─────────────────────────────────────────────────────────────
         elif self.state == State.DONE:

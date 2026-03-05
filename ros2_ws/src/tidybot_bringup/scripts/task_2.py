@@ -1,75 +1,78 @@
 #!/usr/bin/env python3
 """
-Task 2: Pick up {block_color} block and put it in {bin_color} bin
+Task 2: Pick up a colored block and place it in a colored bin.
 
-Orchestrates the existing motion and vision modules via ROS2 topics.
+This script is SELF-CONTAINED — it automatically launches and manages all
+vision nodes internally. You do NOT need to start find_center, obj_dist, or
+simple_pose_fit manually.
 
-─── Nodes to run ──────────────────────────────────────────────────────────────
-Phase 1 (block):
-    ros2 run tidybot_bringup find_center.py     --ros-args -p target_color:=yellow
-    ros2 run tidybot_bringup obj_dist.py        --ros-args -p target_color:=yellow
-    ros2 run tidybot_bringup simple_pose_fit.py --ros-args -p target_color:=yellow
+─── Prerequisites (must already be running) ───────────────────────────────────
+1. Real robot hardware:
+       ros2 launch tidybot_bringup real.launch.py
 
-Phase 2 (bin) — restart vision nodes with new color when task_2 publishes
-                /vision/target_color, OR run a second namespaced set:
-    ros2 run tidybot_bringup find_center.py     --ros-args -p target_color:=blue
-    ros2 run tidybot_bringup obj_dist.py        --ros-args -p target_color:=blue
-    ros2 run tidybot_bringup simple_pose_fit.py --ros-args -p target_color:=blue
+2. Motion planner:
+       ros2 run tidybot_ik motion_planner_real_node
 
-Motion planner (manipulation):
-    ros2 run tidybot_ik motion_planner_node
+─── Run task_2 ────────────────────────────────────────────────────────────────
+Default (yellow block → blue bin, left arm):
+    ros2 run tidybot_bringup task_2.py
 
-─── Topics ────────────────────────────────────────────────────────────────────
-Subscribes:
-  /mask_center                  geometry_msgs/Point    ← find_center
-  /vision/object_distance       std_msgs/Float32       ← obj_dist
-  /object_pose                  geometry_msgs/PoseStamped ← simple_pose_fit
+Custom colors / arm:
+    ros2 run tidybot_bringup task_2.py \
+        --ros-args -p block_color:=yellow -p bin_color:=blue -p arm_name:=left
 
-Publishes:
-  /cmd_vel                      geometry_msgs/Twist    → base motion
-  /camera/pan_tilt_cmd          std_msgs/Float64MultiArray → camera tilt
-  /vision/target_color          std_msgs/String        → signal vision nodes to switch color
+For Speech:
+    ros2 run tidybot_bringup task_2.py \
+        --ros-args -p use_speech:=true
 
-Calls:
-  /plan_to_target               tidybot_msgs/PlanToTarget → motion planner
+Available colors:  red, green, blue, yellow
+Available arms:    left, right
+
+─── What this script does automatically ───────────────────────────────────────
+Phase 1 — Find & Pick block (block_color):
+  • Launches find_center, obj_dist, simple_pose_fit with target_color=block_color
+  • Spins robot until block is centred, approaches, estimates pose
+  • Calls /plan_to_target (mode=pick) — arm opens gripper, descends, grasps,
+    returns home; retries up to 3 times if grasp fails
+
+Phase 2 — Find & Place in bin (bin_color):
+  • Kills Phase 1 vision nodes, relaunches with target_color=bin_color
+  • Spins robot until bin is centred, approaches, estimates pose
+  • Calls /plan_to_target (mode=place) — arm descends with block, opens
+    gripper to release, returns home
 
 ─── State machine ─────────────────────────────────────────────────────────────
   INIT
-    ↓ (vision online)
+    ↓ (vision nodes online)
   FIND_BLOCK       spin until block centred horizontally
     ↓ (h_err < HORIZONTAL_TOL)
-  APPROACH_BLOCK   drive forward; correct heading; stop at APPROACH_DIST
+  APPROACH_BLOCK   drive forward with heading correction; stop at APPROACH_DIST
     ↑ (drift > RECENTER_TOL)  → back to FIND_BLOCK
-    ↓ (distance ≤ 0.35 m)
+    ↓ (distance ≤ 0.50 m)
   TILT_BLOCK       adjust camera tilt for vertical centering
     ↓ (v_err < VERTICAL_TOL)
   WAIT_BLOCK_POSE  wait for fresh /object_pose from simple_pose_fit
     ↓
-  GRASP            call /plan_to_target for grasp pose; wait for result
-    ↑ (failed, retries left) → back to WAIT_BLOCK_POSE
-    ↓ (success)
-  FIND_BIN         publish /vision/target_color=bin_color; spin to find bin
+  GRASP            call /plan_to_target (mode=pick); retry up to 3x if grasped=False
+    ↓ (success + grasped)
+  FIND_BIN         relaunch vision nodes with bin_color; spin to find bin
     ↓
-  APPROACH_BIN     same approach logic for bin
+  APPROACH_BIN     same approach logic as block
     ↑ (drift)      → back to FIND_BIN
     ↓
   TILT_BIN         centre bin vertically
     ↓
   WAIT_BIN_POSE    wait for fresh /object_pose
     ↓
-  PLACE            call /plan_to_target for place pose; wait for result
+  PLACE            call /plan_to_target (mode=place)
     ↓
   DONE / ERROR
-
-Usage:
-    ros2 run tidybot_bringup task_2.py
-    ros2 run tidybot_bringup task_2.py \\
-        --ros-args -p block_color:=yellow -p bin_color:=blue -p arm_name:=right
 """
 
 import time
+import subprocess
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 
@@ -113,13 +116,14 @@ TILT_MAX        =  0.5  # rad
 POSE_WAIT_TIMEOUT  = 8.0   # s
 RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target result (includes execution)
 MAX_GRASP_RETRIES  = 3
+GRASP_Z            = 0.07  # fixed grasp/place height in base_link frame (m)
 
 # =============================================================================
 # States
 # =============================================================================
 
 class State(Enum):
-    INIT           = auto()
+    WAIT_SPEECH    = auto()   # (optional) wait for /speech_extraction colors
     # ── Block ─────────────────────────────
     FIND_BLOCK     = auto()   # spin to centre block horizontally
     APPROACH_BLOCK = auto()   # drive forward; stop when close enough
@@ -148,11 +152,13 @@ class Task2Node(Node):
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter('block_color', 'yellow')
         self.declare_parameter('bin_color',   'blue')
-        self.declare_parameter('arm_name',    'right')
+        self.declare_parameter('arm_name',    'left')
+        self.declare_parameter('use_speech',  False)
 
-        self.block_color: str = self.get_parameter('block_color').value
-        self.bin_color:   str = self.get_parameter('bin_color').value
-        self.arm_name:    str = self.get_parameter('arm_name').value
+        self.block_color: str  = self.get_parameter('block_color').value
+        self.bin_color:   str  = self.get_parameter('bin_color').value
+        self.arm_name:    str  = self.get_parameter('arm_name').value
+        self.use_speech:  bool = self.get_parameter('use_speech').value
 
         # ── Callback groups ──────────────────────────────────────────────────
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
@@ -187,22 +193,58 @@ class Task2Node(Node):
         self._grasp_retries:  int = 0
 
         self._pending_future = None   # async /plan_to_target future
+        self._vision_procs: List[subprocess.Popen] = []
+        self._speech_proc:  Optional[subprocess.Popen] = None
+
+        # ── Optional speech subscription ─────────────────────────────────────
+        if self.use_speech:
+            from tidybot_msgs.msg import SpeechExtraction
+            self.create_subscription(
+                SpeechExtraction, '/speech_extraction', self._speech_cb, 10)
 
         # ── State machine ────────────────────────────────────────────────────
-        self.state       = State.FIND_BLOCK
-        self.state_start = time.time()
+        if self.use_speech:
+            self.state = State.WAIT_SPEECH
+            # Launch speech extraction node (mic mode)
+            self._speech_proc = subprocess.Popen([
+                'ros2', 'run', 'tidybot_bringup', 'speech_extraction_node.py',
+            ])
+        else:
+            self.state = State.FIND_BLOCK
+            self._start_vision_nodes(self.block_color)
 
+        self.state_start = time.time()
         self.create_timer(0.05, self._loop)  # 20 Hz
 
         self.get_logger().info('=' * 60)
         self.get_logger().info(f'Task 2: Pick [{self.block_color}] block → [{self.bin_color}] bin')
-        self.get_logger().info(f'Arm: {self.arm_name}')
-        self.get_logger().info('Waiting for vision nodes …')
+        self.get_logger().info(f'Arm: {self.arm_name}  |  use_speech: {self.use_speech}')
+        if self.use_speech:
+            self.get_logger().info('Waiting for voice command...')
         self.get_logger().info('=' * 60)
 
     # =========================================================================
     # Callbacks
     # =========================================================================
+
+    def _speech_cb(self, msg):
+        """Receive extracted colors from speech_extraction_node."""
+        if self.state != State.WAIT_SPEECH:
+            return
+        if not msg.success:
+            self.get_logger().warn(
+                f'Speech extraction failed: {msg.error_message} — still waiting...')
+            return
+        self.block_color = msg.object_color
+        self.bin_color   = msg.bin_color
+        self.get_logger().info(
+            f'[Speech] block_color={self.block_color}  bin_color={self.bin_color}')
+        # Kill speech node and start vision nodes for block detection
+        if self._speech_proc is not None:
+            self._speech_proc.terminate()
+            self._speech_proc = None
+        self._start_vision_nodes(self.block_color)
+        self._transition(State.FIND_BLOCK)
 
     def _mask_center_cb(self, msg: Point):
         self.mask_center = msg
@@ -241,13 +283,38 @@ class Task2Node(Node):
         msg.data = [self._cmd_pan, self._cmd_tilt]
         self.pan_tilt_pub.publish(msg)
 
+    def _start_vision_nodes(self, color: str):
+        """Stop any running vision nodes and relaunch with new target color."""
+        self._stop_vision_nodes()
+        scripts = ['find_center.py', 'obj_dist.py', 'simple_pose_fit.py']
+        for script in scripts:
+            proc = subprocess.Popen([
+                'ros2', 'run', 'tidybot_bringup', script,
+                '--ros-args', '-p', f'target_color:={color}', '-p', 'visualize:=true',
+            ])
+            self._vision_procs.append(proc)
+        self.get_logger().info(f'[Vision] Launched {len(scripts)} nodes with target_color={color}')
+
+    def _stop_vision_nodes(self):
+        """Terminate all managed vision node processes."""
+        for proc in self._vision_procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3.0)
+            except Exception:
+                proc.kill()
+        self._vision_procs = []
+
     def _set_target_color(self, color: str):
-        """Signal vision nodes to switch to a new target color."""
+        """Restart vision nodes with new target color and notify via topic."""
         msg = String()
         msg.data = color
         self.color_pub.publish(msg)
-        self.get_logger().info(f'[Vision] target_color → {color}  '
-                               f'(restart vision nodes with this color if needed)')
+        # Clear stale detection data from the previous color
+        self.mask_center    = None
+        self.object_pose    = None
+        self.pose_timestamp = None
+        self._start_vision_nodes(color)
 
     def _transition(self, new_state: State):
         self.get_logger().info(f'[State] {self.state.name} → {new_state.name}')
@@ -293,6 +360,7 @@ class Task2Node(Node):
         return out
 
     def _call_plan_to_target(self, pose_base: PoseStamped,
+                              mode: str = 'pick',
                               duration: float = 5.0) -> bool:
         """
         Build and send an async /plan_to_target request.
@@ -305,12 +373,14 @@ class Task2Node(Node):
             return False
 
         req = PlanToTarget.Request()
-        req.arm_name             = self.arm_name
-        req.target_pose          = pose_base.pose
-        req.use_orientation      = True
-        req.max_condition_number = 100.0
-        req.execute              = True
-        req.duration             = duration
+        req.arm_name                = self.arm_name
+        req.mode                    = mode
+        req.target_pose             = pose_base.pose
+        req.target_pose.position.z  = GRASP_Z
+        req.use_orientation         = True
+        req.max_condition_number    = 100.0
+        req.execute                 = True
+        req.duration                = duration
 
         self._pending_future = self.plan_client.call_async(req)
         return True
@@ -425,6 +495,7 @@ class Task2Node(Node):
                 throttle_duration_sec=1.0)
 
     def _do_plan_to_target(self, success_state: State, fail_state: State,
+                            mode: str = 'pick',
                             retry_state: Optional[State] = None,
                             max_retries: int = 0,
                             retry_count_attr: str = ''):
@@ -446,7 +517,7 @@ class Task2Node(Node):
                 self._transition(State.ERROR)
                 return
 
-            sent = self._call_plan_to_target(pose_base, duration=5.0)
+            sent = self._call_plan_to_target(pose_base, mode=mode, duration=5.0)
             if not sent:
                 return  # retry next tick
 
@@ -473,14 +544,21 @@ class Task2Node(Node):
             result = self._pending_future.result()
             self._pending_future = None
 
-            if result.success:
+            # For pick: treat grasped=False as a failure worth retrying
+            pick_failed = mode == 'pick' and result.success and not result.grasped
+
+            if result.success and not pick_failed:
                 self.get_logger().info(
                     f'[{self.state.name}] Planning/execution succeeded: '
                     f'{result.message}')
                 self._transition(success_state)
             else:
-                self.get_logger().error(
-                    f'[{self.state.name}] Planning failed: {result.message}')
+                if pick_failed:
+                    self.get_logger().warn(
+                        f'[{self.state.name}] Arm reached target but grasp failed')
+                else:
+                    self.get_logger().error(
+                        f'[{self.state.name}] Planning failed: {result.message}')
                 if retry_state is not None and retry_count_attr:
                     retries = getattr(self, retry_count_attr, 0) + 1
                     setattr(self, retry_count_attr, retries)
@@ -501,18 +579,22 @@ class Task2Node(Node):
     def _loop(self):  # noqa: C901
         elapsed = self._elapsed()
 
-        # ── INIT ─────────────────────────────────────────────────────────────
-        if self.state == State.INIT:
-            if self.mask_center is not None:
-                self._set_pan_tilt(0.0, 0.0)
-                self._set_target_color(self.block_color)
-                self.get_logger().info(
-                    f'Vision online – searching for [{self.block_color}] block')
-                self._transition(State.FIND_BLOCK)
-            elif elapsed > 15.0:
+        # ── WAIT_SPEECH ──────────────────────────────────────────────────────
+        if self.state == State.WAIT_SPEECH:
+            if elapsed > 60.0:
                 self.get_logger().error(
-                    'Timed out waiting for /mask_center. '
-                    'Is find_center.py running?')
+                    'Timed out waiting for speech. '
+                    'Falling back to parameter colors: '
+                    f'block={self.block_color}, bin={self.bin_color}')
+                if self._speech_proc is not None:
+                    self._speech_proc.terminate()
+                    self._speech_proc = None
+                self._start_vision_nodes(self.block_color)
+                self._transition(State.FIND_BLOCK)
+            else:
+                self.get_logger().info(
+                    f'Listening for voice command... ({elapsed:.0f}s / 60s)',
+                    throttle_duration_sec=5.0)
 
         # ── FIND_BLOCK ────────────────────────────────────────────────────────
         elif self.state == State.FIND_BLOCK:
@@ -537,6 +619,7 @@ class Task2Node(Node):
             self._do_plan_to_target(
                 success_state=State.FIND_BIN,
                 fail_state=State.ERROR,
+                mode='pick',
                 retry_state=State.WAIT_BLOCK_POSE,
                 max_retries=MAX_GRASP_RETRIES,
                 retry_count_attr='_grasp_retries',
@@ -570,6 +653,7 @@ class Task2Node(Node):
             self._do_plan_to_target(
                 success_state=State.DONE,
                 fail_state=State.ERROR,
+                mode='place',
             )
 
         # ── DONE ─────────────────────────────────────────────────────────────
@@ -602,6 +686,9 @@ def main(args=None):
         pass
     finally:
         node._stop()
+        node._stop_vision_nodes()
+        if node._speech_proc is not None:
+            node._speech_proc.terminate()
         node.destroy_node()
         rclpy.shutdown()
 
