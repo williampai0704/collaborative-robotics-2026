@@ -84,6 +84,8 @@ TILT_MAX  =  0.5       # rad  (tilt up)
 
 # How long to wait for a fresh /object_pose after stopping
 POSE_WAIT_TIMEOUT = 8.0   # s
+SETTLE_TIME       = 2.0   # s — wait for robot to stop moving before accepting poses
+NUM_POSE_SAMPLES  = 5     # number of pose samples to average
 
 # How long to wait for /plan_to_target service result (includes execution time)
 RESULT_TIMEOUT = 30.0   # s
@@ -157,6 +159,7 @@ class Task1Node(Node):
 
         self._pending_future = None   # async service call future
         self._grasp_retries  = 0
+        self._pose_samples: list = []  # collected pose samples for averaging
 
         # ── State machine ────────────────────────────────────────────────────
         self.state       = State.SPINNING
@@ -213,12 +216,40 @@ class Task1Node(Node):
     def _elapsed(self) -> float:
         return time.time() - self.state_start
 
+    def _average_poses(self, poses: list) -> PoseStamped:
+        """Average multiple PoseStamped messages (position mean + quaternion mean)."""
+        positions = np.array([[p.pose.position.x, p.pose.position.y, p.pose.position.z]
+                              for p in poses])
+        quats = np.array([[p.pose.orientation.x, p.pose.orientation.y,
+                           p.pose.orientation.z, p.pose.orientation.w]
+                          for p in poses])
+
+        mean_pos = positions.mean(axis=0)
+
+        # Flip quaternions to same hemisphere before averaging
+        for i in range(1, len(quats)):
+            if np.dot(quats[i], quats[0]) < 0:
+                quats[i] = -quats[i]
+        mean_quat = quats.mean(axis=0)
+        mean_quat /= np.linalg.norm(mean_quat)
+
+        out = PoseStamped()
+        out.header = poses[-1].header
+        out.pose.position.x = float(mean_pos[0])
+        out.pose.position.y = float(mean_pos[1])
+        out.pose.position.z = float(mean_pos[2])
+        out.pose.orientation.x = float(mean_quat[0])
+        out.pose.orientation.y = float(mean_quat[1])
+        out.pose.orientation.z = float(mean_quat[2])
+        out.pose.orientation.w = float(mean_quat[3])
+        return out
+
     def _transform_to_base(self, pose_cam: PoseStamped) -> Optional[PoseStamped]:
         """Transform PoseStamped from camera_depth_optical_frame to base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 'base_link',
-                'camera_depth_optical_frame',
+                'camera_color_optical_frame',
                 rclpy.time.Time(),
                 timeout=Duration(seconds=1.0),
             )
@@ -245,8 +276,8 @@ class Task1Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(P_base[0, 3])
-        out.pose.position.y = float(P_base[1, 3])
+        out.pose.position.x = float(P_base[0, 3]) - 0.01
+        out.pose.position.y = float(P_base[1, 3]) - 0.025
         out.pose.position.z = float(P_base[2, 3])
         qb = ScipyRotation.from_matrix(P_base[:3, :3]).as_quat()
         out.pose.orientation.x = float(qb[0])
@@ -296,30 +327,58 @@ class Task1Node(Node):
                 self.get_logger().info(
                     f'Horizontally centred (cx={mc.x:.0f}, err={h_err:+.0f} px)')
                 self.pose_timestamp = None
+                self._pose_samples.clear()
                 self._transition(State.WAIT_POSE)
 
         # ── WAIT_POSE ─────────────────────────────────────────────────────────
-        # Wait for simple_pose_fit to publish a fresh pose now that the object
-        # is centred in the frame (give it time to recompute).
+        # Wait for robot to settle, then collect multiple pose samples and
+        # average them for a more robust estimate.
         elif self.state == State.WAIT_POSE:
-            if elapsed < 0.3:
-                return   # brief stabilisation pause
+            # Phase 1: let the robot settle after stopping
+            if elapsed < SETTLE_TIME:
+                self.get_logger().info(
+                    f'Settling … ({elapsed:.1f} / {SETTLE_TIME:.0f} s)',
+                    throttle_duration_sec=0.5)
+                return
 
-            # Check for a pose that arrived after we entered this state
+            # Phase 2: collect pose samples
             if self.pose_timestamp is not None and \
-               self.pose_timestamp >= self.state_start:
-                self.get_logger().info('Fresh pose received from simple_pose_fit')
+               self.pose_timestamp >= self.state_start + SETTLE_TIME:
+                # New pose arrived after settle period — record it
+                if len(self._pose_samples) == 0 or \
+                   self.pose_timestamp > self._pose_samples[-1][0]:
+                    self._pose_samples.append(
+                        (self.pose_timestamp, self.object_pose))
+                    self.get_logger().info(
+                        f'Pose sample {len(self._pose_samples)}/{NUM_POSE_SAMPLES}')
+
+            if len(self._pose_samples) >= NUM_POSE_SAMPLES:
+                self.object_pose = self._average_poses(
+                    [s[1] for s in self._pose_samples])
+                self._pose_samples.clear()
+                self.get_logger().info('Averaged pose computed')
                 self._transition(State.SEND_TO_MANIPULATION)
                 return
 
-            if elapsed > POSE_WAIT_TIMEOUT:
-                self.get_logger().error(
-                    'Timed out waiting for /object_pose. '
-                    'Is simple_pose_fit.py running?')
-                self._transition(State.DONE)
-            elif int(elapsed * 2) % 2 == 0:   # log at ~0.5 Hz
+            if elapsed > POSE_WAIT_TIMEOUT + SETTLE_TIME:
+                if len(self._pose_samples) > 0:
+                    self.get_logger().warn(
+                        f'Timed out with {len(self._pose_samples)} samples '
+                        f'– using partial average')
+                    self.object_pose = self._average_poses(
+                        [s[1] for s in self._pose_samples])
+                    self._pose_samples.clear()
+                    self._transition(State.SEND_TO_MANIPULATION)
+                else:
+                    self.get_logger().error(
+                        'Timed out waiting for /object_pose. '
+                        'Is simple_pose_fit.py running?')
+                    self._transition(State.DONE)
+            elif int(elapsed * 2) % 2 == 0:
                 self.get_logger().info(
-                    f'Waiting for pose … ({elapsed:.1f} / {POSE_WAIT_TIMEOUT:.0f} s)',
+                    f'Waiting for pose … ({elapsed:.1f} / '
+                    f'{POSE_WAIT_TIMEOUT + SETTLE_TIME:.0f} s, '
+                    f'samples: {len(self._pose_samples)}/{NUM_POSE_SAMPLES})',
                     throttle_duration_sec=1.0)
 
         # ── SEND_TO_MANIPULATION ──────────────────────────────────────────────
@@ -345,8 +404,8 @@ class Task1Node(Node):
                 req.mode                 = 'pick'
                 req.target_pose          = pose_base.pose
                 req.target_pose.position.z = GRASP_Z
-                req.use_orientation      = True
-                req.max_condition_number = 100.0
+                req.use_orientation      = False
+                req.max_condition_number = 500.0
                 req.execute              = True
                 req.duration             = 5.0
 

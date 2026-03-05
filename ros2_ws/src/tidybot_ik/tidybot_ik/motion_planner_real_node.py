@@ -65,7 +65,7 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('urdf_path', '')
         self.declare_parameter('ik_dt', 0.3)
         self.declare_parameter('ik_max_iterations', 200)
-        self.declare_parameter('position_tolerance', 0.03)
+        self.declare_parameter('position_tolerance', 0.01)
         self.declare_parameter('orientation_tolerance', 0.1)
         self.declare_parameter('min_collision_distance', 0.05)  # Safe distance boundary (5cm)
         self.declare_parameter('ik_damping', 1e-5)
@@ -545,7 +545,7 @@ class MotionPlannerRealNode(Node):
 
         if mode == 'pick':
             log.info(f'[{arm}] PICK: closing left gripper...')
-            self.left_gripper.close('left', duration=3.0)
+            self.left_gripper.close('left', duration=2.0)
         else:  # place
             log.info(f'[{arm}] PLACE: opening left gripper...')
             self.left_gripper.open('left', duration=2.0)

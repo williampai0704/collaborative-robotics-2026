@@ -44,7 +44,7 @@ GRIPPER_PRESSURE_UPPER = 350   # Maximum PWM (avoid motor overload)
 # Real (dynamixel_bus):  0.022 (open) → -0.014 (closed)
 FINGER_LIMITS = {
     'sim': {'open': 0.037, 'closed': 0.015},
-    'sdk': {'open': 0.022, 'closed': -0.014},
+    'sdk': {'open': 0.035, 'closed': 0.015},
 }
 
 # Finger joint names per side
@@ -162,7 +162,7 @@ class GripperController:
             # Stop gripper
             self._publish_sdk(side, 0.0)
 
-    def open(self, side: str, duration: float = 2.0):
+    def open(self, side: str, duration: float = 1.5):
         """
         Open the gripper.
 
@@ -172,7 +172,7 @@ class GripperController:
         """
         self.set_position(side, 0.0, duration)
 
-    def close(self, side: str, duration: float = 2.0):
+    def close(self, side: str, duration: float = 1.5):
         """
         Close the gripper.
 
@@ -182,7 +182,7 @@ class GripperController:
         """
         self.set_position(side, 1.0, duration)
 
-    def open_both(self, duration: float = 2.0):
+    def open_both(self, duration: float = 1.5):
         """Open both grippers simultaneously."""
         if self.mode == 'sim':
             msg = Float64MultiArray()
@@ -205,7 +205,7 @@ class GripperController:
             self._publish_sdk('right', 0.0)
             self._publish_sdk('left', 0.0)
 
-    def close_both(self, duration: float = 2.0):
+    def close_both(self, duration: float = 1.5):
         """Close both grippers simultaneously."""
         if self.mode == 'sim':
             msg = Float64MultiArray()
