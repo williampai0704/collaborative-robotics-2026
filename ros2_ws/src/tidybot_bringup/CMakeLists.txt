@@ -47,6 +47,7 @@ install(PROGRAMS
   scripts/ee_trajectory_plotter.py
   scripts/task_1.py
   scripts/task_2.py
+  scripts/task_3.py
   # Vision scripts
   scripts/vision/find_center.py
   scripts/vision/color_mask.py

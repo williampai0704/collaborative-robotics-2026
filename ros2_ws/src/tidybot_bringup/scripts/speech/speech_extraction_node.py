@@ -126,6 +126,7 @@ class SpeechExtractionNode(Node):
         self.declare_parameter('google_api_key', '')
         self.declare_parameter('json_key_path', '')
         self.declare_parameter('publish_rate', 1.0)
+        self.declare_parameter('extraction_prompt', '')  # overrides EXTRACTION_PROMPT if set
 
         # Get parameters
         self.use_mic = self.get_parameter('use_mic').get_parameter_value().bool_value
@@ -133,6 +134,8 @@ class SpeechExtractionNode(Node):
         self.audio_file_path = self.get_parameter('audio_file_path').get_parameter_value().string_value
         google_api_key = self.get_parameter('google_api_key').get_parameter_value().string_value
         json_key_path = self.get_parameter('json_key_path').get_parameter_value().string_value
+        custom_prompt = self.get_parameter('extraction_prompt').get_parameter_value().string_value
+        active_prompt = custom_prompt if custom_prompt else self.EXTRACTION_PROMPT
 
         # Try to find credentials in config folder if not provided
         if not json_key_path and not google_api_key:
@@ -160,7 +163,7 @@ class SpeechExtractionNode(Node):
 
         try:
             self.gemini = GeminiClass(
-                prompt=self.EXTRACTION_PROMPT,
+                prompt=active_prompt,
                 api_key=google_api_key if google_api_key else None,
                 json_key_path=json_key_path if json_key_path else None
             )
