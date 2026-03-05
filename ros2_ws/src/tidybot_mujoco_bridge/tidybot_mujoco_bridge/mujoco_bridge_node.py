@@ -117,11 +117,17 @@ class MuJoCoBridgeNode(Node):
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
 
-            # Load home keyframe if available for stable initial state
+            # Load keyframe for stable initial state
+            # Prefer scene-specific 'scene_home' (includes extra objects), fall back to 'home'
             try:
-                home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
-                mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
-                self.get_logger().info('Loaded home keyframe for stable initial state')
+                try:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'scene_home')
+                    mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                    self.get_logger().info('Loaded scene_home keyframe for stable initial state')
+                except Exception:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
+                    mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                    self.get_logger().info('Loaded home keyframe for stable initial state')
             except Exception:
                 self.get_logger().warn('No home keyframe found, using default state')
 

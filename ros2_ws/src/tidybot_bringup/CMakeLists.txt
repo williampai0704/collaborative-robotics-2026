@@ -25,10 +25,13 @@ install(PROGRAMS
   scripts/test_camera_sim.py
   scripts/test_arms_sim.py
   scripts/test_planner_sim.py
+  scripts/test_pickup_sim.py
   scripts/test_real_hardware.py
   scripts/test_base_real.py
   scripts/test_arms_real.py
   scripts/test_grippers_real.py
+  scripts/test_grasp_real.py
+  scripts/test_right_gripper.py
   scripts/test_pan_tilt_real.py
   scripts/test_torque_hold.py
   scripts/test_full_robot.py
