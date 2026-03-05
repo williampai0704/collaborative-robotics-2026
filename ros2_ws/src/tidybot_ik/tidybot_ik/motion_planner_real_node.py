@@ -62,7 +62,7 @@ class MotionPlannerRealNode(Node):
         # Declare parameters for IK solver, tolerances, and safety margins
         self.declare_parameter('urdf_path', '')
         self.declare_parameter('ik_dt', 0.3)
-        self.declare_parameter('ik_max_iterations', 200)
+        self.declare_parameter('ik_max_iterations', 500)
         self.declare_parameter('position_tolerance', 0.03)
         self.declare_parameter('orientation_tolerance', 0.1)
         self.declare_parameter('min_collision_distance', 0.05)  # Safe distance boundary (5cm)
