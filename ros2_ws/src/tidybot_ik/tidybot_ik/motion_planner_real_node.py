@@ -31,9 +31,6 @@ from interbotix_xs_msgs.msg import JointGroupCommand
 from tidybot_msgs.srv import PlanToTarget
 from tidybot_control.gripper_controller import GripperController
 
-# [NEW] Import the GripperController
-from tidybot_control.gripper_controller import GripperController
-
 
 class MotionPlannerRealNode(Node):
     """Motion planner with IK using Pinocchio for real hardware."""
