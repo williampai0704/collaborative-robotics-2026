@@ -16,11 +16,12 @@ Usage:
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction, ExecuteProcess # <-- 추가
 from launch.conditions import IfCondition
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
 
 
 def launch_setup(context, *args, **kwargs):
@@ -40,6 +41,8 @@ def launch_setup(context, *args, **kwargs):
     repo_root = os.environ.get('TIDYBOT_REPO_ROOT', '')
     if not repo_root:
         repo_root = os.path.expanduser('~/Documents/collaborative-robotics-2026')
+
+    sim_path = os.path.join(repo_root, 'simulation')
 
     # Construct model path using scene argument
     model_path = os.path.join(repo_root, 'simulation', 'assets', 'mujoco', scene)
@@ -101,6 +104,7 @@ def launch_setup(context, *args, **kwargs):
         name='motion_planner',
         output='screen',
         condition=IfCondition(use_motion_planner),
+        additional_env={'TIDYBOT_SIMULATION_PATH': sim_path},
         parameters=[{
             'model_path': ik_model_path,
             'ik_dt': 0.002,
@@ -121,6 +125,34 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(use_rviz),
         parameters=[{'use_sim_time': use_sim_time}]
     )
+    # ==========================================================
+    # [추가된 부분!] 시뮬레이션 시작 3초 후 로봇 양팔을 안전한 자세로 전개
+    # ==========================================================
+    # 관절 각도(라디안): [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+    initial_pose = "[0.0, -0.5, 0.5, 0.0, 0.0, 0.0]"
+
+    right_init = TimerAction(
+        period=3.0,  # 시뮬레이션은 금방 켜지므로 3초 대기
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'topic', 'pub', '--once', '/right_arm/joint_cmd', 
+                     'std_msgs/msg/Float64MultiArray', f'{{data: {initial_pose}}}'],
+                output='screen'
+            )
+        ]
+    )
+
+    left_init = TimerAction(
+        period=3.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['ros2', 'topic', 'pub', '--once', '/left_arm/joint_cmd', 
+                     'std_msgs/msg/Float64MultiArray', f'{{data: {initial_pose}}}'],
+                output='screen'
+            )
+        ]
+    )
+    # ==========================================================
 
     return [
         robot_state_publisher,
@@ -129,6 +161,8 @@ def launch_setup(context, *args, **kwargs):
         left_arm_controller,
         motion_planner,
         rviz,
+        right_init,
+        left_init
     ]
 
 

@@ -125,7 +125,7 @@
       <!-- Custom camera mount attached underneath the top bar of the robot base (right side) -->
       <body name="camera_mount" pos="0 -0.1125 0.285" euler="0 0 -1.5708">
         <geom type="mesh" mesh="camera_mount" pos="0 0 0"
-              contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+              contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
         <!-- ==================== PAN-TILT CAMERA SYSTEM ==================== -->
         <!-- LocoBot-style 2-DOF pan-tilt with Intel RealSense D435 -->
@@ -134,20 +134,20 @@
         <inertial pos="0.012 0.000496 0.018504" mass="0.098997"
                   diaginertia="0.0000276300 0.0000204300 0.0000276300"/>
         <joint name="camera_pan" type="hinge" axis="0 0 1" range="-1.5708 1.5708" damping="0.1"/>
-        <geom type="mesh" mesh="locobot_pan" euler="0 0 1.5708" contype="0" conaffinity="0" group="2" rgba="0.2 0.2 0.2 1"/>
+        <geom type="mesh" mesh="locobot_pan" euler="0 0 1.5708" contype="1" conaffinity="1" group="2" rgba="0.2 0.2 0.2 1"/>
 
         <!-- Tilt link - offset from pan link per URDF: xyz="0.025034 0 0.019" -->
         <body name="tilt_link" pos="0.025034 0 0.019">
           <inertial pos="0.0237737 0 0" mass="0.019845"
                     diaginertia="0.0000021677 0.0000063634 0.0000066157"/>
           <joint name="camera_tilt" type="hinge" axis="0 1 0" range="-1.5708 1.309" damping="0.1"/>
-          <geom type="mesh" mesh="locobot_tilt" euler="0 0 1.5708" contype="0" conaffinity="0" group="2" rgba="0.2 0.2 0.2 1"/>
+          <geom type="mesh" mesh="locobot_tilt" euler="0 0 1.5708" contype="1" conaffinity="1" group="2" rgba="0.2 0.2 0.2 1"/>
 
           <!-- Camera link - offset from tilt link per URDF: xyz="0.05318 0.0175 0.000009" -->
           <body name="camera_link" pos="0.05318 0.0175 0.000009">
             <inertial pos="-0.008972 -0.015818 0.000003" mass="0.072"
                       diaginertia="0.0000465400 0.0000069128 0.0000468600"/>
-            <geom type="mesh" mesh="locobot_camera" contype="0" conaffinity="0" group="2" rgba="0.55 0.55 0.55 1"/>
+            <geom type="mesh" mesh="locobot_camera" contype="1" conaffinity="1" group="2" rgba="0.55 0.55 0.55 1"/>
 
             <!-- Intel RealSense D435 Cameras -->
             <!-- MuJoCo cameras look along -Z by default, with +Y as "up" -->
@@ -166,43 +166,43 @@
       <!-- 6-DOF arm: waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate -->
       <body name="right_arm_base_link" pos="-0.15 -0.1199 0.3847" euler="0 0 -1.5708">
         <geom type="mesh" mesh="wx250s_base" pos="-0.095773 0 -0.10565" quat="0.5 0.5 0.5 0.5"
-              contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+              contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
         <body name="right_shoulder_link" pos="0 0 0.066175">
           <inertial pos="0.0000223 0.0000415 0.0066287" mass="0.480879" diaginertia="0.000379 0.000556 0.000589"/>
           <joint name="right_waist" axis="0 0 1" range="-3.14159 3.14159" damping="0.1"/>
           <geom type="mesh" mesh="wx250s_shoulder" pos="0 0 -0.003" euler="0 0 1.5708"
-                contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
           <body name="right_upper_arm_link" pos="0 0 0.03865">
             <inertial pos="0.0171605 0 0.191323" mass="0.430811" diaginertia="0.003463 0.003587 0.0004566"/>
             <joint name="right_shoulder" axis="0 1 0" range="-1.8849 1.9897" damping="0.1"/>
             <geom type="mesh" mesh="wx250s_upper_arm" euler="0 0 1.5708"
-                  contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
             <body name="right_upper_forearm_link" pos="0.04975 0 0.25">
               <inertial pos="0.107963 0.000116 0" mass="0.234589" diaginertia="0.0000397 0.0008878 0.000888"/>
               <joint name="right_elbow" axis="0 1 0" range="-2.1468 1.6057" damping="0.1"/>
               <geom type="mesh" mesh="wx250s_upper_forearm"
-                    contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                    contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
               <body name="right_lower_forearm_link" pos="0.175 0 0">
                 <inertial pos="0.0374395 0.0052225 0" mass="0.220991" diaginertia="0.0000637 0.0001677 0.0001834"/>
                 <joint name="right_forearm_roll" axis="1 0 0" range="-3.14159 3.14159" damping="0.1"/>
                 <geom type="mesh" mesh="wx250s_lower_forearm" euler="3.14159 0 0"
-                      contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                      contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                 <body name="right_wrist_link" pos="0.075 0 0">
                   <inertial pos="0.04236 -0.0000107 0.010577" mass="0.084957" diaginertia="0.0000308 0.0000282 0.0000315"/>
                   <joint name="right_wrist_angle" axis="0 1 0" range="-1.7453 2.1468" damping="0.1"/>
                   <geom type="mesh" mesh="wx250s_wrist" euler="0 0 1.5708"
-                        contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                        contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                   <body name="right_gripper_link" pos="0.065 0 0">
                     <inertial pos="0.02163 0 0.01141" mass="0.072885" diaginertia="0.0000254 0.0000184 0.0000167"/>
                     <joint name="right_wrist_rotate" axis="1 0 0" range="-3.14159 3.14159" damping="0.1"/>
                     <geom type="mesh" mesh="wx250s_gripper" pos="-0.02 0 0" euler="0 0 1.5708"
-                          contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                          contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                     <body name="right_ee_arm_link" pos="0.043 0 0">
                       <inertial pos="0 0 0" mass="0.001" diaginertia="0.001 0.001 0.001"/>
@@ -210,7 +210,7 @@
                       <!-- Gripper bar -->
                       <body name="right_gripper_bar_link" pos="0 0 0">
                         <geom type="mesh" mesh="wx250s_gripper_bar" pos="-0.063 0 0" euler="0 0 1.5708"
-                              contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                              contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                         <body name="right_fingers_link" pos="0.023 0 0">
                           <!-- Left finger -->
@@ -247,43 +247,43 @@
       <!-- 6-DOF arm: waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate -->
       <body name="left_arm_base_link" pos="0.15 -0.1199 0.3847" euler="0 0 -1.5708">
         <geom type="mesh" mesh="wx250s_base" pos="-0.095773 0 -0.10565" quat="0.5 0.5 0.5 0.5"
-              contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+              contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
         <body name="left_shoulder_link" pos="0 0 0.066175">
           <inertial pos="0.0000223 0.0000415 0.0066287" mass="0.480879" diaginertia="0.000379 0.000556 0.000589"/>
           <joint name="left_waist" axis="0 0 1" range="-3.14159 3.14159" damping="0.1"/>
           <geom type="mesh" mesh="wx250s_shoulder" pos="0 0 -0.003" euler="0 0 1.5708"
-                contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
           <body name="left_upper_arm_link" pos="0 0 0.03865">
             <inertial pos="0.0171605 0 0.191323" mass="0.430811" diaginertia="0.003463 0.003587 0.0004566"/>
             <joint name="left_shoulder" axis="0 1 0" range="-1.8849 1.9897" damping="0.1"/>
             <geom type="mesh" mesh="wx250s_upper_arm" euler="0 0 1.5708"
-                  contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
             <body name="left_upper_forearm_link" pos="0.04975 0 0.25">
               <inertial pos="0.107963 0.000116 0" mass="0.234589" diaginertia="0.0000397 0.0008878 0.000888"/>
               <joint name="left_elbow" axis="0 1 0" range="-2.1468 1.6057" damping="0.1"/>
               <geom type="mesh" mesh="wx250s_upper_forearm"
-                    contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                    contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
               <body name="left_lower_forearm_link" pos="0.175 0 0">
                 <inertial pos="0.0374395 0.0052225 0" mass="0.220991" diaginertia="0.0000637 0.0001677 0.0001834"/>
                 <joint name="left_forearm_roll" axis="1 0 0" range="-3.14159 3.14159" damping="0.1"/>
                 <geom type="mesh" mesh="wx250s_lower_forearm" euler="3.14159 0 0"
-                      contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                      contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                 <body name="left_wrist_link" pos="0.075 0 0">
                   <inertial pos="0.04236 -0.0000107 0.010577" mass="0.084957" diaginertia="0.0000308 0.0000282 0.0000315"/>
                   <joint name="left_wrist_angle" axis="0 1 0" range="-1.7453 2.1468" damping="0.1"/>
                   <geom type="mesh" mesh="wx250s_wrist" euler="0 0 1.5708"
-                        contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                        contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                   <body name="left_gripper_link" pos="0.065 0 0">
                     <inertial pos="0.02163 0 0.01141" mass="0.072885" diaginertia="0.0000254 0.0000184 0.0000167"/>
                     <joint name="left_wrist_rotate" axis="1 0 0" range="-3.14159 3.14159" damping="0.1"/>
                     <geom type="mesh" mesh="wx250s_gripper" pos="-0.02 0 0" euler="0 0 1.5708"
-                          contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                          contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                     <body name="left_ee_arm_link" pos="0.043 0 0">
                       <inertial pos="0 0 0" mass="0.001" diaginertia="0.001 0.001 0.001"/>
@@ -291,7 +291,7 @@
                       <!-- Gripper bar -->
                       <body name="left_gripper_bar_link" pos="0 0 0">
                         <geom type="mesh" mesh="wx250s_gripper_bar" pos="-0.063 0 0" euler="0 0 1.5708"
-                              contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
+                              contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1"/>
 
                         <body name="left_fingers_link" pos="0.023 0 0">
                           <!-- Left finger -->
@@ -324,7 +324,15 @@
         </body>
       </body>
     </body>
+    <body name="target_marker" mocap="true" pos="0 0 -1">
+     <geom type="sphere" size="0.01" rgba="1 0 0 0.5" contype="0" conaffinity="0"/>
+    </body>
+    <body name="test_box" pos="0.3 0.0 0.05">
+      <freejoint/>
+      <geom type="box" size="0.0254 0.0254 0.0254" rgba="0.2 0.5 0.8 1" mass="0.01" contype="1" conaffinity="1"/>
+    </body>
   </worldbody>
+
 
   <actuator>
     <!-- Base actuators -->
@@ -367,12 +375,14 @@
     <key name="home" qpos="0 0 1.5708
       0 0
       0 0 0 0 0 0 0.037 0.037
-      0 0 0 0 0 0 0.037 0.037"
+      0 0 0 0 0 0 0.037 0.037
+      0.3 0 0.05 1 0 0 0"
       ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
     <key name="retract" qpos="0 0 1.5708
       0 0
       0 -0.5 1.57 0 0 0 0.037 0.037
-      0 -0.5 1.57 0 0 0 0.037 0.037"
+      0 -0.5 1.57 0 0 0 0.037 0.037
+      0.3 0 0.05 1 0 0 0"
       ctrl="0 0 1.5708 0 0 0 -0.5 1.57 0 0 0 0.037 0.037 0 -0.5 1.57 0 0 0 0.037 0.037"/>
   </keyframe>
 </mujoco>

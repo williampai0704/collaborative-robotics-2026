@@ -30,6 +30,7 @@ setup(
             'dynamixel_bus_node = tidybot_control.dynamixel_bus_node:main',
             'gripper_wrapper_node = tidybot_control.gripper_wrapper_node:main',
             'microphone_node = tidybot_control.microphone_node:main',
+            "task_sequencer_action = tidybot_control.task_sequencer_action:main",
         ],
     },
 )

@@ -22,6 +22,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import JointState, Image, CameraInfo
 from geometry_msgs.msg import Twist, TransformStamped, Pose2D
+from geometry_msgs.msg import Pose
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64MultiArray, Header, Bool
 from tf2_ros import TransformBroadcaster
@@ -116,11 +117,17 @@ class MuJoCoBridgeNode(Node):
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
 
-            # Load home keyframe if available for stable initial state
+            # Load keyframe for stable initial state
+            # Prefer scene-specific 'scene_home' (includes extra objects), fall back to 'home'
             try:
-                home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
-                mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
-                self.get_logger().info('Loaded home keyframe for stable initial state')
+                try:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'scene_home')
+                    mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                    self.get_logger().info('Loaded scene_home keyframe for stable initial state')
+                except Exception:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
+                    mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                    self.get_logger().info('Loaded home keyframe for stable initial state')
             except Exception:
                 self.get_logger().warn('No home keyframe found, using default state')
 
@@ -244,6 +251,10 @@ class MuJoCoBridgeNode(Node):
             Pose2D, '/base/target_pose', self.target_pose_callback, 10
         )
 
+        self.marker_sub = self.create_subscription(
+            Pose, '/target_marker_pose', self.marker_callback, 10
+        )
+
         # Timers
         sim_period = 1.0 / self.sim_rate
         self.sim_timer = self.create_timer(sim_period, self.sim_step_callback)
@@ -264,6 +275,19 @@ class MuJoCoBridgeNode(Node):
         self.get_logger().info(f'  Sim rate: {self.sim_rate} Hz')
         self.get_logger().info(f'  Publish rate: {self.publish_rate} Hz')
         self.get_logger().info(f'  Camera rate: {self.camera_rate} Hz')
+
+    def marker_callback(self, msg: Pose):
+        mocap_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "target_marker")
+        if mocap_id == -1:
+            self.get_logger().warn("target_marker body not found in XML!")
+            return
+            
+        mocap_mocapid = self.model.body_mocapid[mocap_id]
+        
+
+        self.data.mocap_pos[mocap_mocapid][0] = msg.position.x
+        self.data.mocap_pos[mocap_mocapid][1] = msg.position.y
+        self.data.mocap_pos[mocap_mocapid][2] = msg.position.z
 
     def run_viewer(self):
         """Run MuJoCo viewer in a separate thread."""

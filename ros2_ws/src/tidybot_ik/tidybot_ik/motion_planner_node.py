@@ -21,7 +21,7 @@ import mujoco
 import mink
 from pathlib import Path
 from threading import Lock
-
+import os 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -72,15 +72,19 @@ class MotionPlannerNode(Node):
         self.position_tolerance = self.get_parameter('position_tolerance').get_parameter_value().double_value
         self.orientation_tolerance = self.get_parameter('orientation_tolerance').get_parameter_value().double_value
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
-
         # Find model path
         if model_path_param:
+            # 1. 파라미터로 경로가 전달된 경우 (launch 파일에서 전달됨)
             model_path = Path(model_path_param)
+        elif os.environ.get('TIDYBOT_SIMULATION_PATH'):
+            # 2. 환경 변수가 있는 경우
+            sim_path = os.environ.get('TIDYBOT_SIMULATION_PATH')
+            model_path = Path(sim_path) / 'assets/mujoco/tidybot_wx250s_bimanual.xml'
         else:
-            # Default: look relative to workspace
-            model_path = Path(__file__).parent.parent.parent.parent.parent.parent / \
-                'simulation/assets/mujoco/tidybot_wx250s_bimanual.xml'
-
+            # 3. 둘 다 없는 경우 에러 발생
+            self.get_logger().error("Environment variable 'TIDYBOT_SIMULATION_PATH' not set!")
+            raise EnvironmentError("Please source setup_env.bash or set TIDYBOT_SIMULATION_PATH")
+        
         if not model_path.exists():
             self.get_logger().error(f'MuJoCo model not found: {model_path}')
             raise FileNotFoundError(f'Model not found: {model_path}')
@@ -146,18 +150,45 @@ class MotionPlannerNode(Node):
         }
 
         # Bodies for collision checking
+        # self.collision_bodies = {
+        #     'right': ['right_upper_arm_link', 'right_forearm_link', 'right_wrist_link', 'right_gripper_link'],
+        #     'left': ['left_upper_arm_link', 'left_forearm_link', 'left_wrist_link', 'left_gripper_link'],
+        # }
+
+        # made by JJ
+        #  Expanded collision bodies to include all arm links, gripper fingers, and camera mount for more comprehensive checking. 
+        # This helps avoid false positives from center-point distance checks and better reflects actual geometry.
+        
         self.collision_bodies = {
-            'right': ['right_upper_arm_link', 'right_forearm_link', 'right_wrist_link', 'right_gripper_link'],
-            'left': ['left_upper_arm_link', 'left_forearm_link', 'left_wrist_link', 'left_gripper_link'],
-        }
+                    'right': [
+                        'right_upper_arm_link', 'right_upper_forearm_link', 'right_lower_forearm_link', 
+                        'right_wrist_link', 'right_gripper_link', 'right_gripper_bar_link', 
+                        'right_left_finger_link', 'right_right_finger_link'
+                    ],
+                    'left': [
+                        'left_upper_arm_link', 'left_upper_forearm_link', 'left_lower_forearm_link', 
+                        'left_wrist_link', 'left_gripper_link', 'left_gripper_bar_link', 
+                        'left_left_finger_link', 'left_right_finger_link'
+                    ],
+                    'base': [
+                        'base_link', 'camera_mount', 'pan_link', 'tilt_link', 'camera_link'
+                    ]
+                }
+
+        
 
         # Get body IDs
+        # updated by JJ to include base bodies for collision checking,
+        #  and to use actual MuJoCo contact detection rather than center-point distance which gives false positives for symmetric arm configurations.
         self.body_ids = {}
-        for arm in ['right', 'left']:
+        for arm in ['right', 'left', 'base']:
             self.body_ids[arm] = []
             for bname in self.collision_bodies[arm]:
                 bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, bname)
-                self.body_ids[arm].append(bid)
+                if bid != -1:
+                    self.body_ids[arm].append(bid)
+                else: 
+                    self.get_logger().warn(f"Collision body '{bname}' not found in XML.")
 
         # Current joint states
         self.current_joint_positions = {}
@@ -174,6 +205,8 @@ class MotionPlannerNode(Node):
             'right': self.create_publisher(ArmCommand, '/right_arm/cmd', 10),
             'left': self.create_publisher(ArmCommand, '/left_arm/cmd', 10),
         }
+
+        self.marker_pub = self.create_publisher(Pose, '/target_marker_pose', 10)
 
         # Subscriber for joint states
         self.joint_state_sub = self.create_subscription(
@@ -218,20 +251,20 @@ class MotionPlannerNode(Node):
                     self.current_joint_positions[name] = msg.position[i]
 
     def get_arm_joint_positions(self, arm_name: str, use_default_if_zero: bool = True) -> np.ndarray:
-        """Get current joint positions for an arm.
-
-        If use_default_if_zero is True and positions are all near zero,
-        returns DEFAULT_SEED to avoid singularity issues.
-        """
+        """Get current joint positions for an arm."""
         with self.joint_lock:
             positions = np.zeros(6)
             for i, jname in enumerate(self.arm_joints[arm_name]):
-                positions[i] = self.current_joint_positions.get(jname, 0.0)
+                # ==========================================
+                # [MODIFIED] Removed the fallback to 0.0. 
+                # We strictly use the actual physical joint state.
+                # ==========================================
+                positions[i] = self.current_joint_positions[jname]
 
-            # Use default seed if positions are all near zero (uninitialized or singular config)
-            if use_default_if_zero and np.allclose(positions, 0.0, atol=0.01):
-                self.get_logger().info(f'Using default seed for {arm_name} arm (current positions near zero)')
-                return self.DEFAULT_SEED.copy()
+            # [MODIFIED] Disabled the DEFAULT_SEED overwrite to prevent jumping to Home pose.
+            # if use_default_if_zero and np.allclose(positions, 0.0, atol=0.01):
+            #     self.get_logger().info(f'Using default seed for {arm_name} arm (current positions near zero)')
+            #     return self.DEFAULT_SEED.copy()
 
             return positions
 
@@ -295,13 +328,11 @@ class MotionPlannerNode(Node):
         """
         # Create a fresh configuration with current seed
         self.data.qpos[:] = 0
-        # Set base joints to match actual robot pose (critical for correct FK)
         self.set_base_joints()
-        # Set the active arm's seed
         for i, jname in enumerate(self.arm_joints[arm_name]):
             addr = self.joint_qpos_addrs[jname]
             self.data.qpos[addr] = seed[i]
-        # Set the other arm to its current position (for collision awareness)
+            
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_positions = self.get_arm_joint_positions(other_arm, use_default_if_zero=False)
         for i, jname in enumerate(self.arm_joints[other_arm]):
@@ -324,16 +355,28 @@ class MotionPlannerNode(Node):
         )
         ee_task.set_target(target_pose)
 
+        # ==========================================
+        # [MODIFIED] Balanced PostureTask to prevent "Elbow Flips"
+        # We use a moderate cost (1e-2) to guide the solver to stay close to the 
+        # current physical configuration without over-constraining the primary task.
+        # This prevents the robot from violently twisting to alternative IK solutions.
+        # ==========================================
+        posture_task = mink.PostureTask(self.model, cost=1e-2)
+        posture_task.set_target_from_configuration(self.configuration)
+
         # Solve IK iteratively
-        # VelocityLimit freezes all non-arm DOFs (compatible with quadprog)
         for iteration in range(self.ik_max_iterations):
             vel = mink.solve_ik(
                 self.configuration,
-                [ee_task],
+                # [MODIFIED] Included posture_task alongside the primary ee_task
+                [ee_task, posture_task], 
                 dt=self.ik_dt,
                 solver="quadprog",
-                damping=1e-3,
-                limits=[self.freeze_vel_limits[arm_name]],
+                # [MODIFIED] Increased damping slightly (1e-2) for smoother iteration steps
+                damping=1e-2, 
+                # [MODIFIED] Reverted limits to use ONLY freeze_vel_limits.
+                # Adding ConfigurationLimit here caused QP solver failures due to conflicting constraints.
+                limits=[self.freeze_vel_limits[arm_name]], 
             )
             self.configuration.integrate_inplace(vel, self.ik_dt)
 
@@ -345,31 +388,26 @@ class MotionPlannerNode(Node):
         solution = np.zeros(6)
         for i, jname in enumerate(self.arm_joints[arm_name]):
             addr = self.joint_qpos_addrs[jname]
-            # Normalize angle to [-pi, pi] before clamping (handles wraparound)
             solution[i] = self.normalize_angle(self.configuration.q[addr])
 
-        # Clamp to joint limits
+        # Clamp to joint limits (failsafe applied AFTER the IK solver to prevent solver crash)
         for i, (_, (low, high)) in enumerate(self.JOINT_LIMITS.items()):
             solution[i] = np.clip(solution[i], low, high)
 
-        # Compute errors
-        # Update MuJoCo data with solution to get FK
+        # Compute errors and Update MuJoCo data
         self.set_base_joints()
         for i, jname in enumerate(self.arm_joints[arm_name]):
             addr = self.joint_qpos_addrs[jname]
             self.data.qpos[addr] = solution[i]
         mujoco.mj_forward(self.model, self.data)
 
-        # Get actual end-effector pose
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, ee_site)
         actual_pos = self.data.site_xpos[site_id].copy()
         actual_mat = self.data.site_xmat[site_id].reshape(3, 3)
 
-        # Position error
         target_pos = target_pose.translation()
         position_error = np.linalg.norm(actual_pos - target_pos)
 
-        # Orientation error (angle from rotation matrix difference)
         if use_orientation:
             target_mat = target_pose.rotation().as_matrix()
             R_diff = target_mat.T @ actual_mat
@@ -435,6 +473,13 @@ class MotionPlannerNode(Node):
 
         Returns: (collision_free, min_distance)
         """
+        """
+        updated by JJ
+        Comprehensive collision check:
+         - Right Arm vs Left Arm
+         - Right Arm vs Base/Mounts
+         - Left Arm vs Base/Mounts
+        """
         # Set both arm configurations
         self.set_base_joints()
         for i, jname in enumerate(self.arm_joints['right']):
@@ -449,6 +494,7 @@ class MotionPlannerNode(Node):
         # Check MuJoCo contacts for inter-arm collisions
         right_body_set = set(self.body_ids['right'])
         left_body_set = set(self.body_ids['left'])
+        base_body_set = set(self.body_ids['base'])
         min_distance = float('inf')
 
         for i in range(self.data.ncon):
@@ -457,17 +503,22 @@ class MotionPlannerNode(Node):
             body2 = self.model.geom_bodyid[contact.geom2]
 
             # Check if contact is between a right arm geom and a left arm geom
-            is_inter_arm = ((body1 in right_body_set and body2 in left_body_set) or
-                           (body1 in left_body_set and body2 in right_body_set))
-            if is_inter_arm:
-                # contact.dist < 0 means penetration
+            b1_in_right, b2_in_right = body1 in right_body_set, body2 in right_body_set
+            b1_in_left, b2_in_left = body1 in left_body_set, body2 in left_body_set
+            b1_in_base, b2_in_base = body1 in base_body_set, body2 in base_body_set
+
+            is_arm_arm = (b1_in_right and b2_in_left) or (b1_in_left and b2_in_right)
+            is_right_base = (b1_in_right and b2_in_base) or (b1_in_base and b2_in_right)
+            is_left_base = (b1_in_left and b2_in_base) or (b1_in_base and b2_in_left)
+
+            if is_arm_arm or is_right_base or is_left_base:
                 min_distance = min(min_distance, contact.dist)
 
         # If no inter-arm contacts found, arms are far apart
         if min_distance == float('inf'):
             min_distance = 1.0  # No contacts = safe
 
-        collision_free = min_distance >= -self.min_collision_distance
+        collision_free = min_distance >= self.min_collision_distance
         return collision_free, min_distance
 
     def plan_to_target_callback(self, request, response):
@@ -480,16 +531,52 @@ class MotionPlannerNode(Node):
             response.message = f"Invalid arm_name '{request.arm_name}'. Use 'right' or 'left'."
             return response
 
+        # ==========================================
+        # [MODIFIED] STRICT SAFETY CHECK
+        # Prevent the planner from running if we haven't received actual sensor data.
+        # Falling back to 0.0 causes violent physical jerks in the robot.
+        # ==========================================
+        if not self.current_joint_positions or self.arm_joints[arm_name][0] not in self.current_joint_positions:
+            self.get_logger().error(f"🚨 Cannot plan: Initial /joint_states for {arm_name} arm not yet received!")
+            response.success = False
+            response.message = "Planner has no joint state data yet. Please wait a second for sensor data."
+            return response
+
         mode_str = 'pos+orient' if request.use_orientation else 'pos-only'
         self.get_logger().info(f'Planning for {arm_name} arm ({mode_str})...')
 
         # Get current joint positions as seed
+        # (Since we passed the safety check above, we are 100% sure the real data exists)
         seed = self.get_arm_joint_positions(arm_name)
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
 
         # Convert target pose to SE3
         target_se3 = self.pose_to_se3(request.target_pose, request.use_orientation)
+
+        # ==========================================
+        # [MODIFIED] Added diagnostic logging to verify IK start and target points.
+        # This will prove if the solver is using the "Home" position instead 
+        # of the actual current robot position as the user suspected.
+        # ==========================================
+        self.get_logger().info("\n--- [DIAGNOSIS] SERVER IK SOLVER INPUTS ---")
+        self.get_logger().info(f"  [START] Seed Configuration (Current Joint States):")
+        for i, jname in enumerate(self.arm_joints[arm_name]):
+            self.get_logger().info(f"    {jname}: {seed[i]:.4f} rad")
+            
+        target_xyz = target_se3.translation()
+        self.get_logger().info(f"  [TARGET] Cartesian Goal: x={target_xyz[0]:.4f}, y={target_xyz[1]:.4f}, z={target_xyz[2]:.4f}")
+        self.get_logger().info("-----------------------------------------------\n")
+        # ==========================================
+
+        # Publish target pose as a marker for visualization (in world frame)
+        marker_pose = Pose()
+        world_translation = target_se3.translation()
+        marker_pose.position.x = float(world_translation[0])
+        marker_pose.position.y = float(world_translation[1])
+        marker_pose.position.z = float(world_translation[2])
+        self.marker_pub.publish(marker_pose)
+        # ===================================
 
         # Solve IK
         ik_success, solution, pos_error, ori_error = self.solve_ik(
@@ -499,13 +586,13 @@ class MotionPlannerNode(Node):
         response.position_error = pos_error
         response.orientation_error = ori_error
         response.joint_positions = solution.tolist()
-
+        self.get_logger().info('Investigating IK solution. . .')
         if not ik_success:
             response.success = False
             response.message = f"IK failed: position error={pos_error:.4f}m, orientation error={ori_error:.4f}rad"
             self.get_logger().warn(response.message)
             return response
-
+        self.get_logger().info('IK solution found. Checking singularity and collisions. . .')
         # Check singularity (Jacobian condition number)
         condition_number = self.compute_jacobian_condition(arm_name, solution)
         response.condition_number = condition_number
@@ -515,7 +602,7 @@ class MotionPlannerNode(Node):
             response.message = f"Near singularity: condition number={condition_number:.1f} > {request.max_condition_number}"
             self.get_logger().warn(response.message)
             return response
-
+        self.get_logger().info('Configuration is not near singularity. Checking collisions. . .')
         # Check arm-arm collision
         if arm_name == 'right':
             collision_free, min_dist = self.check_arm_collision(solution, other_arm_positions)
@@ -527,7 +614,29 @@ class MotionPlannerNode(Node):
             response.message = f"Arm collision detected: min distance={min_dist:.3f}m < {self.min_collision_distance}m"
             self.get_logger().warn(response.message)
             return response
+        self.get_logger().info('No collisions at solution configuration. Validating path for collisions. . .')
+        # Path validation
+        steps = 20
+        start_joints = self.get_arm_joint_positions(arm_name)
+        goal_joints = solution.copy()
+        
+        for i in range(1, steps + 1):
+            alpha = i / steps
+            interp_joints = (1 - alpha) * start_joints + alpha * goal_joints
+            
+            # Check collision at interpolated configuration
+            if arm_name == 'right':
+                collision_free, min_dist = self.check_arm_collision(interp_joints, other_arm_positions)
+            else:
+                collision_free, min_dist = self.check_arm_collision(other_arm_positions, interp_joints)
 
+            if not collision_free:
+                response.success = False
+                response.message = f"Collision detected along path at step {i}/{steps}: min distance={min_dist:.3f}m < {self.min_collision_distance}m"
+                self.get_logger().warn(response.message)
+                return response
+
+        self.get_logger().info('Path is collision-free. Planning successful. . .')
         # Planning succeeded
         response.success = True
         msg = f"Planning succeeded: pos_err={pos_error:.4f}m"

@@ -31,12 +31,27 @@ import time
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
 from interbotix_xs_msgs.msg import JointSingleCommand
 
 
 # PWM pressure limits (from Interbotix SDK)
 GRIPPER_PRESSURE_LOWER = 150   # Minimum PWM for movement
 GRIPPER_PRESSURE_UPPER = 350   # Maximum PWM (avoid motor overload)
+
+# Finger position limits (meters) — differ between sim and real hardware
+# Sim (mujoco_bridge):   0.037 (open) → 0.015 (closed)
+# Real (dynamixel_bus):  0.022 (open) → -0.014 (closed)
+FINGER_LIMITS = {
+    'sim': {'open': 0.037, 'closed': 0.015},
+    'sdk': {'open': 0.022, 'closed': -0.014},
+}
+
+# Finger joint names per side
+FINGER_JOINT_NAMES = {
+    'right': ['right_left_finger', 'right_right_finger'],
+    'left': ['left_left_finger', 'left_right_finger'],
+}
 
 
 class GripperController:
@@ -81,6 +96,18 @@ class GripperController:
                 JointSingleCommand, '/left_arm/commands/joint_single', 10
             )
 
+        # Subscribe to aggregated /joint_states for grasp detection.
+        # Works for both sim (mujoco_bridge) and real hardware (joint_state_aggregator).
+        self.finger_positions = {}
+        self.joint_state_sub = node.create_subscription(
+            JointState, '/joint_states', self._joint_state_callback, 10
+        )
+
+        # Select finger position limits based on mode
+        limits = FINGER_LIMITS.get(mode, FINGER_LIMITS['sim'])
+        self.finger_open_pos = limits['open']
+        self.finger_closed_pos = limits['closed']
+
         self.node.get_logger().debug(f'GripperController initialized (mode={mode})')
 
     def _publish_sim(self, side: str, position: float):
@@ -121,7 +148,7 @@ class GripperController:
             start_time = time.time()
             while (time.time() - start_time) < duration:
                 self._publish_sim(side, position)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
         else:
             # Convert to PWM: 0.0 -> +pwm (open), 1.0 -> -pwm (close)
@@ -129,7 +156,7 @@ class GripperController:
             start_time = time.time()
             while (time.time() - start_time) < duration:
                 self._publish_sdk(side, pwm)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
 
             # Stop gripper
@@ -164,7 +191,7 @@ class GripperController:
             while (time.time() - start_time) < duration:
                 self.right_pub.publish(msg)
                 self.left_pub.publish(msg)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
         else:
             pwm = self.pwm_value  # Positive = open
@@ -172,7 +199,7 @@ class GripperController:
             while (time.time() - start_time) < duration:
                 self._publish_sdk('right', pwm)
                 self._publish_sdk('left', pwm)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
             # Stop grippers
             self._publish_sdk('right', 0.0)
@@ -187,7 +214,7 @@ class GripperController:
             while (time.time() - start_time) < duration:
                 self.right_pub.publish(msg)
                 self.left_pub.publish(msg)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
         else:
             pwm = -self.pwm_value  # Negative = close
@@ -195,8 +222,87 @@ class GripperController:
             while (time.time() - start_time) < duration:
                 self._publish_sdk('right', pwm)
                 self._publish_sdk('left', pwm)
-                rclpy.spin_once(self.node, timeout_sec=0.01)
+                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
             # Stop grippers
             self._publish_sdk('right', 0.0)
             self._publish_sdk('left', 0.0)
+
+    def _joint_state_callback(self, msg: JointState):
+        """Store latest finger joint positions from /joint_states."""
+        for i, name in enumerate(msg.name):
+            if 'finger' in name and i < len(msg.position):
+                self.finger_positions[name] = msg.position[i]
+
+    def check_grasp(self, side: str, threshold: float = 0.003) -> bool:
+        """
+        Check if the gripper successfully grasped an object.
+
+        Compares actual finger position against the fully-closed position.
+        If the fingers stopped short of fully closed (blocked by an object),
+        the grasp is considered successful.
+
+        Call this after close() or set_position() with position=1.0.
+
+        Args:
+            side: 'right' or 'left'
+            threshold: Minimum distance (meters) above closed position to
+                       count as a successful grasp. Default 0.003m (3mm).
+
+        Returns:
+            True if an object is detected between the fingers, False otherwise.
+        """
+        finger_names = FINGER_JOINT_NAMES.get(side)
+        if finger_names is None:
+            self.node.get_logger().warn(f"Invalid side '{side}' for check_grasp")
+            return False
+
+        # Wait briefly to ensure we have fresh joint state data.
+        # Use sleep rather than spin_once so this is safe when the node is
+        # already managed by an executor (e.g. MultiThreadedExecutor).
+        time.sleep(0.4)
+
+        # Debug: show all stored finger positions
+        self.node.get_logger().info(
+            f'check_grasp({side}): finger_positions={self.finger_positions}'
+        )
+
+        # Read actual finger positions
+        positions = []
+        for fname in finger_names:
+            pos = self.finger_positions.get(fname)
+            if pos is None:
+                self.node.get_logger().warn(
+                    f"No joint state for '{fname}' — is /joint_states being published?"
+                )
+                return False
+            positions.append(pos)
+
+        # Average of both finger positions
+        avg_pos = sum(positions) / len(positions)
+
+        # If fingers stopped above (closed + threshold), something is between them
+        grasped = avg_pos > (self.finger_closed_pos + threshold)
+
+        self.node.get_logger().info(
+            f'Grasp check ({side}): finger_pos={avg_pos:.4f}m, '
+            f'closed={self.finger_closed_pos}m, threshold={threshold}m, '
+            f'grasped={grasped}'
+        )
+        return grasped
+
+    def close_and_check(self, side: str, duration: float = 5.0,
+                        threshold: float = 0.003) -> bool:
+        """
+        Close the gripper and check if an object was grasped.
+
+        Args:
+            side: 'right' or 'left'
+            duration: Time to publish close command (seconds).
+            threshold: Grasp detection threshold in meters.
+
+        Returns:
+            True if an object is detected between the fingers, False otherwise.
+        """
+        self.close(side, duration)
+        return self.check_grasp(side, threshold)

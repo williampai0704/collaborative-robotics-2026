@@ -42,7 +42,7 @@ Prerequisites:
 import os
 import sys
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction, ExecuteProcess # added
 from launch.conditions import IfCondition
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -215,6 +215,37 @@ def launch_setup(context, *args, **kwargs):
                 output='screen',
             ))
 
+
+            # 관절 각도(라디안): [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+            # 아래는 팔을 살짝 앞으로 구부린 '대기(Ready)' 자세 예시입니다. (필요시 숫자 변경 가능)
+            # initial_pose = "[0.0, -0.8, 0.8, 0.0, 0.0, 0.0]"
+
+            # right_init = TimerAction(
+            #     period=8.0,  # 하드웨어가 완전히 켜질 때까지 8초 대기
+            #     actions=[
+            #         ExecuteProcess(
+            #             cmd=['ros2', 'topic', 'pub', '--once', '/right_arm/joint_cmd', 
+            #                     'std_msgs/msg/Float64MultiArray', f'{{data: {initial_pose}}}'],
+            #             output='screen'
+            #         )
+            #     ]
+            # )
+            # nodes.append(right_init)
+
+            # if use_left_arm:
+            #     left_init = TimerAction(
+            #         period=8.0,
+            #         actions=[
+            #             ExecuteProcess(
+            #                 cmd=['ros2', 'topic', 'pub', '--once', '/left_arm/joint_cmd', 
+            #                         'std_msgs/msg/Float64MultiArray', f'{{data: {initial_pose}}}'],
+            #                 output='screen'
+            #             )
+            #         ]
+            #     )
+            #     nodes.append(left_init)
+            # ==========================================================
+
     # RealSense camera
     if use_camera:
         nodes.append(Node(
@@ -341,7 +372,7 @@ def generate_launch_description():
             description='Launch microphone recording node'
         ),
         DeclareLaunchArgument(
-            'use_planner', default_value='false',
+            'use_planner', default_value='true',
             description='Launch IK motion planner for real hardware'
         ),
         DeclareLaunchArgument(
