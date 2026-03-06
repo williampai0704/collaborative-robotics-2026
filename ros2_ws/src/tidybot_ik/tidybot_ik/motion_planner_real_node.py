@@ -58,6 +58,8 @@ class MotionPlannerRealNode(Node):
         np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0]),
     ]
 
+    GRIPPER_DURATION = 0.5
+
     def __init__(self):
         super().__init__('motion_planner_real')
 
@@ -535,7 +537,7 @@ class MotionPlannerRealNode(Node):
 
         if mode == 'pick':
             log.info(f'[{arm}] PICK: opening left gripper...')
-            self.left_gripper.open('left', duration=2.0)
+            self.left_gripper.open('left', duration=self.GRIPPER_DURATION)
 
         log.info(f'[{arm}] Moving to hover...')
         self._execute_motion_step(arm_name, start_q, hover_q, duration)
@@ -545,10 +547,10 @@ class MotionPlannerRealNode(Node):
 
         if mode == 'pick':
             log.info(f'[{arm}] PICK: closing left gripper...')
-            self.left_gripper.close('left', duration=2.0)
+            self.left_gripper.close('left', duration=self.GRIPPER_DURATION)
         else:  # place
             log.info(f'[{arm}] PLACE: opening left gripper...')
-            self.left_gripper.open('left', duration=2.0)
+            self.left_gripper.open('left', duration=self.GRIPPER_DURATION)
 
         log.info(f'[{arm}] Returning to start...')
         self._execute_motion_step(arm_name, final_q, hover_q, duration)
