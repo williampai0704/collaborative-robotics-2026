@@ -58,7 +58,7 @@ class MotionPlannerRealNode(Node):
         np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0]),
     ]
 
-    GRIPPER_DURATION = 0.5
+    GRIPPER_DURATION = 1.5
 
     def __init__(self):
         super().__init__('motion_planner_real')

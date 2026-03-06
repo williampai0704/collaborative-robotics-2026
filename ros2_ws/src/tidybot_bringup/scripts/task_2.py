@@ -49,8 +49,6 @@ Phase 2 — Find & Place in bin (bin_color):
   APPROACH_BLOCK   drive forward with heading correction; stop at APPROACH_DIST
     ↑ (drift > RECENTER_TOL)  → back to FIND_BLOCK
     ↓ (distance ≤ 0.50 m)
-  TILT_BLOCK       adjust camera tilt for vertical centering
-    ↓ (v_err < VERTICAL_TOL)
   WAIT_BLOCK_POSE  wait for fresh /object_pose from simple_pose_fit
     ↓
   GRASP            call /plan_to_target (mode=pick); retry up to 3x if grasped=False
@@ -59,9 +57,7 @@ Phase 2 — Find & Place in bin (bin_color):
     ↓
   APPROACH_BIN     same approach logic as block
     ↑ (drift)      → back to FIND_BIN
-    ↓
-  TILT_BIN         centre bin vertically
-    ↓
+    ↓ (distance ≤ 0.50 m)
   WAIT_BIN_POSE    wait for fresh /object_pose
     ↓
   PLACE            call /plan_to_target (mode=place)
@@ -85,7 +81,7 @@ from rclpy.executors import MultiThreadedExecutor
 import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from std_msgs.msg import Float32, String, Float64MultiArray
+from std_msgs.msg import Float32, String
 
 from scipy.spatial.transform import Rotation as ScipyRotation
 
@@ -102,16 +98,13 @@ CENTER_Y      = IMAGE_HEIGHT / 2.0
 
 HORIZONTAL_TOL  = 50    # px  — stop spinning: |cx − CENTER_X| < this
 RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
-VERTICAL_TOL    = 60    # px  — stop tilting: |cy − CENTER_Y| < this
 
-APPROACH_DIST   = 0.50  # m   — stop driving when object is this close
+APPROACH_DIST     = 0.35  # m   — stop driving when block is this close
+BIN_APPROACH_DIST = 0.35  # m   — stop driving when bin is this close (closer for place)
 APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
 SPIN_SPEED      = 0.3   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
-TILT_GAIN       = 0.001 # rad / px
-TILT_MIN        = -1.2  # rad
-TILT_MAX        =  0.5  # rad
 
 POSE_WAIT_TIMEOUT  = 8.0   # s — additional wait after settle for pose samples
 SETTLE_TIME        = 2.0   # s — wait for robot to stop moving before accepting poses
@@ -129,13 +122,11 @@ class State(Enum):
     # ── Block ─────────────────────────────
     FIND_BLOCK     = auto()   # spin to centre block horizontally
     APPROACH_BLOCK = auto()   # drive forward; stop when close enough
-    TILT_BLOCK     = auto()   # centre block vertically in camera
     WAIT_BLOCK_POSE= auto()   # wait for fresh /object_pose
     GRASP          = auto()   # call /plan_to_target for grasp; wait for result
     # ── Bin ───────────────────────────────
     FIND_BIN       = auto()   # spin to centre bin horizontally
     APPROACH_BIN   = auto()   # drive forward; stop when close enough
-    TILT_BIN       = auto()   # centre bin vertically in camera
     WAIT_BIN_POSE  = auto()   # wait for fresh /object_pose
     PLACE          = auto()   # call /plan_to_target for place; wait for result
     # ─────────────────────────────────────
@@ -166,9 +157,8 @@ class Task2Node(Node):
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ── Publishers ──────────────────────────────────────────────────────
-        self.cmd_vel_pub  = self.create_publisher(Twist,             '/cmd_vel',              10)
-        self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd',  10)
-        self.color_pub    = self.create_publisher(String,            '/vision/target_color',  10)
+        self.cmd_vel_pub  = self.create_publisher(Twist,  '/cmd_vel',             10)
+        self.color_pub    = self.create_publisher(String, '/vision/target_color', 10)
 
         # ── Service client ───────────────────────────────────────────────────
         self.plan_client = self.create_client(
@@ -190,8 +180,6 @@ class Task2Node(Node):
         self.object_pose:     Optional[PoseStamped] = None
         self.pose_timestamp:  Optional[float]       = None
 
-        self._cmd_pan:  float = 0.0
-        self._cmd_tilt: float = 0.0
         self._grasp_retries:  int = 0
 
         self._pending_future = None   # async /plan_to_target future
@@ -278,14 +266,6 @@ class Task2Node(Node):
         t.angular.z = float(np.clip(-h_err * ANGULAR_GAIN, -0.5, 0.5))
         self.cmd_vel_pub.publish(t)
 
-    def _set_pan_tilt(self, pan: float, tilt: float):
-        tilt = float(np.clip(tilt, TILT_MIN, TILT_MAX))
-        self._cmd_pan  = float(pan)
-        self._cmd_tilt = tilt
-        msg = Float64MultiArray()
-        msg.data = [self._cmd_pan, self._cmd_tilt]
-        self.pan_tilt_pub.publish(msg)
-
     def _start_vision_nodes(self, color: str):
         """Stop any running vision nodes and relaunch with new target color."""
         self._stop_vision_nodes()
@@ -361,7 +341,7 @@ class Task2Node(Node):
         """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
+                'base_link', 'camera_color_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=1.0))
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
@@ -381,8 +361,8 @@ class Task2Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(R[0, 3])
-        out.pose.position.y = float(R[1, 3])
+        out.pose.position.x = float(R[0, 3]) - 0.015
+        out.pose.position.y = float(R[1, 3]) - 0.025
         out.pose.position.z = float(R[2, 3])
         qb = ScipyRotation.from_matrix(R[:3, :3]).as_quat()
         out.pose.orientation.x = float(qb[0])
@@ -409,8 +389,8 @@ class Task2Node(Node):
         req.mode                    = mode
         req.target_pose             = pose_base.pose
         req.target_pose.position.z  = GRASP_Z
-        req.use_orientation         = True
-        req.max_condition_number    = 100.0
+        req.use_orientation         = False
+        req.max_condition_number    = 500.0
         req.execute                 = True
         req.duration                = duration
 
@@ -441,7 +421,8 @@ class Task2Node(Node):
         else:
             self._spin()
 
-    def _do_approach(self, find_state: State, tilt_state: State):
+    def _do_approach(self, find_state: State, tilt_state: State,
+                     dist_threshold: float = APPROACH_DIST):
         """Generic approach logic: drive forward while correcting heading."""
         mc   = self.mask_center
         dist = self.object_distance
@@ -465,45 +446,14 @@ class Task2Node(Node):
             self.get_logger().info(
                 f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f} px',
                 throttle_duration_sec=0.5)
-            if dist <= APPROACH_DIST:
+            if dist <= dist_threshold:
                 self._stop()
                 self.get_logger().info(
-                    f'Close enough ({dist:.3f} m ≤ {APPROACH_DIST} m)')
+                    f'Close enough ({dist:.3f} m ≤ {dist_threshold} m)')
                 self._transition(tilt_state)
                 return
 
         self._drive(h_err)
-
-    def _do_tilt(self, find_state: State, next_state: State):
-        """Generic tilt-adjust logic used by both TILT_BLOCK and TILT_BIN."""
-        mc = self.mask_center
-        if mc is None:
-            self.get_logger().warn('Object lost during tilt adjust – re-searching')
-            self._transition(find_state)
-            return
-
-        h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y
-
-        self.get_logger().info(
-            f'[{self.state.name}] h_err={h_err:+.0f}  v_err={v_err:+.0f}  '
-            f'tilt={self._cmd_tilt:.3f} rad',
-            throttle_duration_sec=0.3)
-
-        if abs(h_err) > RECENTER_TOL:
-            self.get_logger().warn(
-                f'Horizontal drift ({h_err:+.0f} px) during tilt – re-searching')
-            self._transition(find_state)
-            return
-
-        if abs(v_err) < VERTICAL_TOL:
-            self.get_logger().info(
-                f'Object centred vertically (v_err={v_err:+.0f} px)')
-            self.pose_timestamp = None
-            self._transition(next_state)
-        else:
-            new_tilt = self._cmd_tilt - v_err * TILT_GAIN
-            self._set_pan_tilt(self._cmd_pan, new_tilt)
 
     def _do_wait_pose(self, next_state: State):
         """Wait for robot to settle, then collect and average pose samples.
@@ -671,12 +621,7 @@ class Task2Node(Node):
         # ── APPROACH_BLOCK ────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BLOCK:
             self._do_approach(find_state=State.FIND_BLOCK,
-                              tilt_state=State.TILT_BLOCK)
-
-        # ── TILT_BLOCK ────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BLOCK:
-            self._do_tilt(find_state=State.FIND_BLOCK,
-                          next_state=State.WAIT_BLOCK_POSE)
+                              tilt_state=State.WAIT_BLOCK_POSE)
 
         # ── WAIT_BLOCK_POSE ───────────────────────────────────────────────────
         elif self.state == State.WAIT_BLOCK_POSE:
@@ -695,7 +640,6 @@ class Task2Node(Node):
             # On grasp success, switch vision to bin color and reset camera
             if self.state == State.FIND_BIN:
                 self._grasp_retries = 0
-                self._set_pan_tilt(0.0, 0.0)
                 self._set_target_color(self.bin_color)
 
         # ── FIND_BIN ──────────────────────────────────────────────────────────
@@ -705,12 +649,8 @@ class Task2Node(Node):
         # ── APPROACH_BIN ──────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BIN:
             self._do_approach(find_state=State.FIND_BIN,
-                              tilt_state=State.TILT_BIN)
-
-        # ── TILT_BIN ──────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BIN:
-            self._do_tilt(find_state=State.FIND_BIN,
-                          next_state=State.WAIT_BIN_POSE)
+                              tilt_state=State.WAIT_BIN_POSE,
+                              dist_threshold=BIN_APPROACH_DIST)
 
         # ── WAIT_BIN_POSE ─────────────────────────────────────────────────────
         elif self.state == State.WAIT_BIN_POSE:

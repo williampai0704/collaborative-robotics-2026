@@ -276,8 +276,8 @@ class Task1Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(P_base[0, 3]) - 0.015
-        out.pose.position.y = float(P_base[1, 3]) - 0.025
+        out.pose.position.x = float(P_base[0, 3]) -0.015
+        out.pose.position.y = float(P_base[1, 3]) -0.025
         out.pose.position.z = float(P_base[2, 3])
         qb = ScipyRotation.from_matrix(P_base[:3, :3]).as_quat()
         out.pose.orientation.x = float(qb[0])
