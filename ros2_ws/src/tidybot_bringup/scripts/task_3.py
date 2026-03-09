@@ -114,8 +114,9 @@ SPIN_SPEED      = 0.3   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
 TILT_GAIN       = 0.001 # rad / px
-TILT_MIN        = -1.2  # rad
-TILT_MAX        =  0.5  # rad
+TILT_MIN        = -0.5  # rad
+TILT_MAX        =  0.3  # rad
+TILT_SWEEP_SPEED = 0.008 # rad per loop tick (20 Hz → ~0.16 rad/s sweep)
 
 POSE_WAIT_TIMEOUT  = 8.0   # s
 RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target (includes execution)
@@ -212,9 +213,10 @@ class Task3Node(Node):
         self.object_pose:     Optional[PoseStamped] = None
         self.pose_timestamp:  Optional[float]       = None
 
-        self._cmd_pan:       float = 0.0
-        self._cmd_tilt:      float = 0.0
-        self._grasp_retries: int   = 0
+        self._cmd_pan:        float = 0.0
+        self._cmd_tilt:       float = 0.0
+        self._tilt_sweep_dir: float = -1.0  # -1 = sweep down, +1 = sweep up
+        self._grasp_retries:  int   = 0
 
         self._pending_future = None
         self._vision_procs: List[subprocess.Popen] = []
@@ -383,7 +385,7 @@ class Task3Node(Node):
         """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
+                'base_link', 'camera_color_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=1.0))
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
@@ -403,8 +405,8 @@ class Task3Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(R[0, 3])
-        out.pose.position.y = float(R[1, 3])
+        out.pose.position.x = float(R[0, 3]) - 0.015
+        out.pose.position.y = float(R[1, 3]) - 0.025
         out.pose.position.z = float(R[2, 3])
         qb = ScipyRotation.from_matrix(R[:3, :3]).as_quat()
         out.pose.orientation.x = float(qb[0])
@@ -442,11 +444,23 @@ class Task3Node(Node):
     def _do_find(self, next_state: State):
         mc = self.mask_center
         if mc is None:
+            # Target not visible — spin and sweep tilt to search
             self._spin()
+            new_tilt = self._cmd_tilt + self._tilt_sweep_dir * TILT_SWEEP_SPEED
+            if new_tilt <= TILT_MIN:
+                new_tilt = TILT_MIN
+                self._tilt_sweep_dir = 1.0
+            elif new_tilt >= TILT_MAX:
+                new_tilt = TILT_MAX
+                self._tilt_sweep_dir = -1.0
+            self._set_pan_tilt(self._cmd_pan, new_tilt)
             return
         h_err = mc.x - CENTER_X
+        v_err = mc.y - CENTER_Y
+        # Track target vertically while aligning horizontally
+        self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         self.get_logger().info(
-            f'[{self.state.name}] cx={mc.x:.0f}  h_err={h_err:+.0f} px',
+            f'[{self.state.name}] cx={mc.x:.0f}  h_err={h_err:+.0f}  v_err={v_err:+.0f} px',
             throttle_duration_sec=0.5)
         if abs(h_err) < HORIZONTAL_TOL:
             self._stop()
@@ -463,6 +477,9 @@ class Task3Node(Node):
             self._transition(find_state)
             return
         h_err = mc.x - CENTER_X
+        v_err = mc.y - CENTER_Y
+        # Continuously tilt to keep target vertically centred while driving
+        self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         if abs(h_err) > RECENTER_TOL:
             self._stop()
             self.get_logger().warn(f'Heading drift ({h_err:+.0f} px) – re-centring')
@@ -470,7 +487,7 @@ class Task3Node(Node):
             return
         if dist is not None:
             self.get_logger().info(
-                f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f} px',
+                f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f}  v_err={v_err:+.0f} px',
                 throttle_duration_sec=0.5)
             if dist <= APPROACH_DIST:
                 self._stop()
