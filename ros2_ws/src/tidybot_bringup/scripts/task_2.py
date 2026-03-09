@@ -146,7 +146,7 @@ class Task2Node(Node):
         self.declare_parameter('block_color', 'yellow')
         self.declare_parameter('bin_color',   'blue')
         self.declare_parameter('arm_name',    'left')
-        self.declare_parameter('use_speech',  False)
+        self.declare_parameter('use_speech',  True)
 
         self.block_color: str  = self.get_parameter('block_color').value
         self.bin_color:   str  = self.get_parameter('bin_color').value

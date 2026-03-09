@@ -185,7 +185,7 @@ class SpeechExtractionNode(Node):
             )
             self.get_logger().info(
                 f'Mic mode: will record {self.record_duration:.1f}s from /microphone/record')
-            self.create_timer(2.0, self._trigger_mic_recording)
+            self._mic_startup_timer = self.create_timer(2.0, self._trigger_mic_recording)
         elif self.audio_file_path:
             self.get_logger().info(f'File mode: processing {self.audio_file_path}')
             self.process_audio_file(self.audio_file_path)
@@ -198,7 +198,7 @@ class SpeechExtractionNode(Node):
 
     def _trigger_mic_recording(self):
         """Called once by a 2-second startup timer; runs mic I/O in a background thread."""
-        self.destroy_timer(self._trigger_mic_recording)
+        self._mic_startup_timer.cancel()
         threading.Thread(target=self._mic_record_and_process, daemon=True).start()
 
     def _call_mic_service(self, start: bool):
