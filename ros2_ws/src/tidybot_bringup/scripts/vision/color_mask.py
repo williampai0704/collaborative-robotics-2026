@@ -50,12 +50,13 @@ def color_mask(color_img, color_name='r'):
             cv2.inRange(hsv_img, lower1, upper1),
             cv2.inRange(hsv_img, lower2, upper2)
         )
-    elif color == 'green':
+    elif color == 'green': # NOTE: didn't work well in yellow-lit environment, may need tuning
         lower = np.array([40, 70, 50])
         upper = np.array([80, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'blue':
-        lower = np.array([90, 50, 40])
+        lower = np.array([103, 63, 53]) # HACK: for yellow env light.
+        # lower = np.array([90, 50, 40])
         upper = np.array([130, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'yellow':

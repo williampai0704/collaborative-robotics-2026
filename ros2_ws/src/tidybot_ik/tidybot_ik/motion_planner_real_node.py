@@ -537,8 +537,8 @@ class MotionPlannerRealNode(Node):
         arm = arm_name.upper()
 
         if mode == 'pick':
-            log.info(f'[{arm}] PICK: opening left gripper...')
-            self.left_gripper.open('left', duration=self.GRIPPER_DURATION)
+            log.info(f'[{arm}] PICK: opening {arm_name} gripper...')
+            self.left_gripper.open(arm_name, duration=self.GRIPPER_DURATION)
 
         log.info(f'[{arm}] Moving to hover...')
         self._execute_motion_step(arm_name, start_q, hover_q, duration)
@@ -547,18 +547,18 @@ class MotionPlannerRealNode(Node):
         self._execute_motion_step(arm_name, hover_q, final_q, duration)
 
         if mode == 'pick':
-            log.info(f'[{arm}] PICK: closing left gripper...')
-            self.left_gripper.close('left', duration=self.GRIPPER_DURATION)
+            log.info(f'[{arm}] PICK: closing {arm_name} gripper...')
+            self.left_gripper.close(arm_name, duration=self.GRIPPER_DURATION)
         else:  # place
-            log.info(f'[{arm}] PLACE: opening left gripper...')
-            self.left_gripper.open('left', duration=self.GRIPPER_DURATION)
+            log.info(f'[{arm}] PLACE: opening {arm_name} gripper...')
+            self.left_gripper.open(arm_name, duration=self.GRIPPER_DURATION)
 
         log.info(f'[{arm}] Returning to start...')
         self._execute_motion_step(arm_name, final_q, hover_q, duration)
         self._execute_motion_step(arm_name, hover_q, start_q, duration)
 
-        grasped = self.left_gripper.check_grasp('left')
-        log.info(f'[LEFT GRIPPER] check_grasp={grasped}  '
+        grasped = self.left_gripper.check_grasp(arm_name)
+        log.info(f'[{arm} GRIPPER] check_grasp={grasped}  '
                  f'(pick expects True, place expects False)')
         return grasped
 
