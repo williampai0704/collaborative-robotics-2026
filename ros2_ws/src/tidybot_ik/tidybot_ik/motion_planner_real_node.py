@@ -76,6 +76,8 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('workspace_min', [-0.2, -0.5, 0.0])
         self.declare_parameter('workspace_max', [0.8, 0.5, 0.8])
         self.declare_parameter('workspace_frame', 'base_link')
+        self.declare_parameter('use_taught_config', True)   # Use taught warm-start config
+        self.declare_parameter('taught_config_path', '')    # Path to taught_configs.yaml
 
         # Retrieve parameters
         urdf_path_param = self.get_parameter('urdf_path').get_parameter_value().string_value
@@ -191,6 +193,16 @@ class MotionPlannerRealNode(Node):
 
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
+
+        # Load warm-start taught configs (must happen after parameters are read)
+        self.taught_configs: dict = self._load_taught_configs(taught_config_path_param)
+        if self.use_taught_config:
+            self.get_logger().info(
+                f'Warm-start IK: ENABLED — taught configs loaded for arms: {list(self.taught_configs.keys())}'
+            )
+        else:
+            self.get_logger().info('Warm-start IK: DISABLED (use_taught_config=False)')
+
         self.get_logger().info('Motion planner (real hardware) initialized with 2-step Hover & Descend logic.')
 
     def _process_xacro(self, xacro_path: Path) -> str:
@@ -443,47 +455,72 @@ class MotionPlannerRealNode(Node):
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
 
-        # 1. Define Final Target
+        # 1. Define Final Target and check it is within workspace
         final_target_se3 = self.pose_to_se3(request.target_pose)
-        
-        # 2. Define Hover Target (z is overridden to 0.5)
-        hover_target_se3 = self.pose_to_se3(request.target_pose)
-        hover_target_se3.translation[2] = 0.5
 
-        if not self.is_in_workspace(hover_target_se3.translation) or not self.is_in_workspace(final_target_se3.translation):
-            response.success, response.message = False, 'Hover or Final target is out of safe workspace bounds.'
+        if not self.is_in_workspace(final_target_se3.translation):
+            response.success, response.message = False, 'Final target is out of safe workspace bounds.'
             self.get_logger().warn(response.message)
             return response
 
         # =========================================================
-        # PHASE 1: Plan to Hover (z=0.5)
+        # PHASE 1: Determine Hover Configuration
         # =========================================================
-        self.get_logger().info('Phase 1: Planning approach to Hover (z=0.5)')
-        seeds = [primary_seed]
-        for extra in self.EXTRA_SEEDS:
-            if arm_name == 'left':
-                mirrored = extra.copy()
-                mirrored[0], mirrored[3] = -mirrored[0], -mirrored[3]
-                seeds.append(mirrored)
-            else:
-                seeds.append(extra.copy())
+        # Warm-start path: use a physically-taught config as the hover waypoint.
+        # This skips IK for Phase 1 entirely and gives Phase 2 a much better seed.
+        # Fall-back path: compute hover via IK to (x, y, z=0.5) as before.
+        hover_solution = None
+        hover_pos_err, hover_ori_err = 0.0, 0.0
 
-        best_hover, hover_pos_err, hover_ori_err = None, float('inf'), float('inf')
-        for seed in seeds[:self.max_ik_seeds]:
-            success, sol, p_err, o_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, seed)
-            if success:
-                if best_hover is None or (p_err + o_err) < (hover_pos_err + hover_ori_err):
-                    best_hover, hover_pos_err, hover_ori_err = sol, p_err, o_err
-                if p_err < self.position_tolerance * 0.5: break
+        if self.use_taught_config and arm_name in self.taught_configs:
+            arm_cfgs = self.taught_configs[arm_name]
+            warm_seed = arm_cfgs.get(mode, arm_cfgs.get('pick'))
+            if warm_seed is not None:
+                hover_solution = warm_seed.copy()
+                self.get_logger().info(
+                    f'Phase 1 (warm-start): using taught config for {arm_name}/{mode}: '
+                    f'[{", ".join(f"{v:+.4f}" for v in hover_solution)}]'
+                )
 
-        if best_hover is not None:
-            hover_solution = best_hover
-        else:
-            _, hover_solution, hover_pos_err, hover_ori_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, primary_seed)
-            if hover_pos_err > self.position_tolerance:
-                response.success, response.message = False, f"Phase 1 IK failed: pos_err={hover_pos_err:.4f}m"
+        if hover_solution is None:
+            # Fall back to IK-based hover at z = 0.5
+            hover_target_se3 = self.pose_to_se3(request.target_pose)
+            hover_target_se3.translation[2] = 0.5
+
+            if not self.is_in_workspace(hover_target_se3.translation):
+                response.success, response.message = False, 'Hover target is out of safe workspace bounds.'
                 self.get_logger().warn(response.message)
                 return response
+
+            self.get_logger().info('Phase 1 (IK hover): Planning approach to z=0.5')
+            seeds = [primary_seed]
+            for extra in self.EXTRA_SEEDS:
+                if arm_name == 'left':
+                    mirrored = extra.copy()
+                    mirrored[0], mirrored[3] = -mirrored[0], -mirrored[3]
+                    seeds.append(mirrored)
+                else:
+                    seeds.append(extra.copy())
+
+            best_hover = None
+            for seed in seeds[:self.max_ik_seeds]:
+                success, sol, p_err, o_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, seed)
+                if success:
+                    if best_hover is None or (p_err + o_err) < (hover_pos_err + hover_ori_err):
+                        best_hover, hover_pos_err, hover_ori_err = sol, p_err, o_err
+                    if p_err < self.position_tolerance * 0.5:
+                        break
+
+            if best_hover is not None:
+                hover_solution = best_hover
+            else:
+                _, hover_solution, hover_pos_err, hover_ori_err = self.solve_ik(
+                    arm_name, hover_target_se3, request.use_orientation, primary_seed
+                )
+                if hover_pos_err > self.position_tolerance:
+                    response.success, response.message = False, f"Phase 1 IK failed: pos_err={hover_pos_err:.4f}m"
+                    self.get_logger().warn(response.message)
+                    return response
 
         # =========================================================
         # PHASE 2: Plan to Descend (Final Target)
