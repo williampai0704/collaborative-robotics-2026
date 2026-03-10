@@ -22,10 +22,19 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
     <!-- Block to pick up - positioned farther in front of the robot -->
-    <body name="block" pos="0.55 -0.15 0.025">
+    <body name="block" pos="0.45 -0.15 0.025">
       <freejoint name="block_joint"/>
       <geom name="block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="block_material"
         friction="1.0 0.5 0.5" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
+
+  <keyframe>
+    <!-- qpos order: base(3) + pan_tilt(2) + right_arm(6) + right_gripper(2) + left_arm(6) + left_gripper(2) + block_freejoint(7) = 28 -->
+    <key name="scene_home" qpos="0 0 1.5708
+      0 0
+      0 0 0 0 0 0 0.037 0.037
+      0 0 0 0 0 0 0.037 0.037
+      0.45 -0.15 0.025 1 0 0 0"/>
+  </keyframe>
 </mujoco>

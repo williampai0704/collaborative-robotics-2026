@@ -201,11 +201,29 @@ build_ros2_workspace() {
     # Clean previous builds
     rm -rf build install log
 
+    # Force system Python - critical to avoid conda conflicts
+    # This must be done BEFORE sourcing ROS2 and building
+    export PATH="/usr/bin:$PATH"
+    unset PYTHONPATH
+    unset PYTHONHOME
+    
     # Ensure we're using system Python (not conda)
     if [ -n "$CONDA_PREFIX" ]; then
         print_warning "Conda detected. Deactivating for ROS2 build..."
-        conda deactivate 2>/dev/null || true
+        # Deactivate all conda environments
+        while [ -n "$CONDA_PREFIX" ]; do
+            conda deactivate 2>/dev/null || break
+        done
     fi
+
+    # Verify we're using system Python
+    PYTHON_PATH=$(which python3)
+    if [[ "$PYTHON_PATH" == *"conda"* ]] || [[ "$PYTHON_PATH" == *"miniforge"* ]]; then
+        print_error "Still using conda Python: $PYTHON_PATH"
+        print_error "Please run 'conda deactivate' manually and try again"
+        exit 1
+    fi
+    print_status "Using Python: $PYTHON_PATH"
 
     # Source ROS2
     source /opt/ros/$ROS_DISTRO/setup.bash
@@ -213,8 +231,8 @@ build_ros2_workspace() {
     # Ensure dynamixel-sdk is installed (required for interbotix packages)
     sudo apt install -y ros-$ROS_DISTRO-dynamixel-sdk
 
-    # Build
-    colcon build
+    # Build with explicit Python executable
+    colcon build --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 
     print_status "ROS2 workspace built successfully!"
 }
