@@ -22,6 +22,7 @@ Usage:
 """
 
 import numpy as np
+import yaml
 from pathlib import Path
 from threading import Lock
 import subprocess
@@ -80,6 +81,8 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('min_collision_distance', 0.05)  # 5cm
         self.declare_parameter('ik_damping', 1e-5)  # Less damping for better convergence
         self.declare_parameter('max_ik_seeds', 7)  # Max number of IK seeds to try
+        self.declare_parameter('use_taught_config', True)   # Use taught warm-start config
+        self.declare_parameter('taught_config_path', '')    # Path to taught_configs.yaml
 
         # Get parameters
         urdf_path_param = self.get_parameter('urdf_path').get_parameter_value().string_value
@@ -90,6 +93,8 @@ class MotionPlannerRealNode(Node):
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
         self.ik_damping = self.get_parameter('ik_damping').get_parameter_value().double_value
         self.max_ik_seeds = self.get_parameter('max_ik_seeds').get_parameter_value().integer_value
+        self.use_taught_config = self.get_parameter('use_taught_config').get_parameter_value().bool_value
+        taught_config_path_param = self.get_parameter('taught_config_path').get_parameter_value().string_value
 
         # Find URDF path
         if urdf_path_param:
@@ -184,8 +189,18 @@ class MotionPlannerRealNode(Node):
             PlanToTarget, '/plan_to_target', self.plan_to_target_callback
         )
 
+        # Load taught joint configs (warm-start seeds)
+        self.taught_configs: dict = self._load_taught_configs(taught_config_path_param)
+
         self.get_logger().info('Motion planner (real hardware) initialized')
         self.get_logger().info('Service: /plan_to_target')
+        if self.use_taught_config:
+            loaded = list(self.taught_configs.keys())
+            self.get_logger().info(
+                f'Warm-start IK: ENABLED — taught configs loaded for arms: {loaded}'
+            )
+        else:
+            self.get_logger().info('Warm-start IK: DISABLED (use_taught_config=False)')
 
     def _process_xacro(self, xacro_path: Path) -> str:
         """Process xacro file to URDF string."""
@@ -207,6 +222,63 @@ class MotionPlannerRealNode(Node):
         else:
             # Read URDF directly
             return xacro_path.read_text()
+
+    def _load_taught_configs(self, path_param: str) -> dict:
+        """Load taught joint configurations from YAML, keyed as configs[arm_name][label].
+
+        Each value is a numpy array of 6 joint positions in
+        [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate] order.
+        """
+        # Resolve config path
+        if path_param:
+            config_path = Path(path_param)
+        else:
+            # Default: tidybot_bringup/config/taught_configs.yaml (works with symlink-install)
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share = get_package_share_directory('tidybot_bringup')
+                config_path = Path(share) / 'config' / 'taught_configs.yaml'
+            except Exception:
+                config_path = Path(__file__).resolve().parents[4] / \
+                    'tidybot_bringup' / 'config' / 'taught_configs.yaml'
+
+        if not config_path.exists():
+            self.get_logger().warn(
+                f'taught_configs.yaml not found at {config_path}. '
+                'Warm-start disabled until file is created.'
+            )
+            return {}
+
+        try:
+            with open(config_path) as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().error(f'Failed to parse taught_configs.yaml: {e}')
+            return {}
+
+        configs: dict = {}
+        for arm_key, labels in raw.items():
+            # Normalise key: 'left_arm' or 'left' both map to 'left'
+            arm_name = arm_key.replace('_arm', '')
+            if arm_name not in ('left', 'right'):
+                continue
+            if not isinstance(labels, dict):
+                continue
+            configs[arm_name] = {}
+            for label, values in labels.items():
+                if values is None or len(values) != 6:
+                    self.get_logger().warn(
+                        f'taught_configs.yaml: {arm_key}.{label} must have 6 values, skipping.'
+                    )
+                    continue
+                configs[arm_name][label] = np.array(values, dtype=float)
+                self.get_logger().info(
+                    f'  Loaded {arm_name}.{label}: '
+                    f'[{", ".join(f"{v:+.4f}" for v in configs[arm_name][label])}]'
+                )
+
+        self.get_logger().info(f'Loaded taught_configs.yaml from {config_path}')
+        return configs
 
     def joint_state_callback(self, msg: JointState):
         """Update current joint positions from joint states."""
@@ -483,7 +555,8 @@ class MotionPlannerRealNode(Node):
         mode = 'pos+orient' if request.use_orientation else 'pos-only'
         self.get_logger().info(f'Planning for {arm_name} arm ({mode})...')
 
-        # Get current joint positions as primary seed
+        # Get current joint positions (for collision context and trajectory start)
+        start_q = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
         primary_seed = self.get_arm_joint_positions(arm_name)
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
@@ -491,9 +564,26 @@ class MotionPlannerRealNode(Node):
         # Convert target pose to SE3
         target_se3 = self.pose_to_se3(request.target_pose)
 
-        # Build seed list: current position first, then extra seeds.
-        # For the left arm, mirror the waist and forearm_roll signs.
-        seeds = [primary_seed]
+        # Determine warm-start seed (taught config) if available.
+        # The taught config is used as the *first* seed so IK converges from
+        # a known-good physical configuration near the workspace region.
+        warm_seed = None
+        if self.use_taught_config and arm_name in self.taught_configs:
+            arm_cfgs = self.taught_configs[arm_name]
+            # 'pick' is used for all motions for now; extend later if needed.
+            warm_seed = arm_cfgs.get('pick', arm_cfgs.get('place'))
+            if warm_seed is not None:
+                self.get_logger().info(
+                    f'Using warm-start seed for {arm_name}: '
+                    f'[{", ".join(f"{v:+.4f}" for v in warm_seed)}]'
+                )
+
+        # Build seed list: warm-start first (if any), then current pose, then extras.
+        # For the left arm, mirror the waist and forearm_roll signs on extra seeds.
+        seeds = []
+        if warm_seed is not None:
+            seeds.append(warm_seed.copy())
+        seeds.append(primary_seed)
         for extra in self.EXTRA_SEEDS:
             if arm_name == 'left':
                 mirrored = extra.copy()
@@ -578,20 +668,43 @@ class MotionPlannerRealNode(Node):
 
         # Execute if requested
         if request.execute:
-            self.execute_trajectory(arm_name, solution, request.duration)
+            if warm_seed is not None:
+                # Two-step warm-start execution:
+                #   Step 1: current joints  → taught config  (duration seconds)
+                #   Step 2: taught config   → IK solution    (duration seconds)
+                self.get_logger().info(
+                    f'Warm-start execution step 1/2: '
+                    f'current → taught config ({request.duration:.1f}s)'
+                )
+                self.execute_trajectory(arm_name, warm_seed, request.duration, from_q=start_q)
+                self.get_logger().info(
+                    f'Warm-start execution step 2/2: '
+                    f'taught config → IK target ({request.duration:.1f}s)'
+                )
+                self.execute_trajectory(arm_name, solution, request.duration, from_q=warm_seed)
+            else:
+                self.execute_trajectory(arm_name, solution, request.duration)
             response.executed = True
-            self.get_logger().info(f'Executed motion over {request.duration}s')
+            self.get_logger().info(f'Executed motion (warm_seed={warm_seed is not None})')
         else:
             response.executed = False
 
         return response
 
-    def execute_trajectory(self, arm_name: str, target: np.ndarray, duration: float):
-        """Execute trajectory by interpolating from current to target position."""
+    def execute_trajectory(self, arm_name: str, target: np.ndarray, duration: float,
+                           from_q: 'np.ndarray | None' = None):
+        """Execute trajectory by interpolating from start to target position.
+
+        Args:
+            arm_name: 'left' or 'right'
+            target: target joint positions (6-DOF)
+            duration: motion duration in seconds
+            from_q: explicit start configuration; if None, reads current joint states
+        """
         import time
 
-        # Get current joint positions
-        start = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
+        # Get starting joint positions
+        start = from_q if from_q is not None else self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
 
         # Interpolation parameters
         rate_hz = 50.0  # Command rate
