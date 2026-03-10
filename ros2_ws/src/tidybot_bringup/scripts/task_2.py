@@ -101,8 +101,8 @@ RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
 
 APPROACH_DIST     = 0.35  # m   — stop driving when block is this close
 BIN_APPROACH_DIST = 0.35  # m   — stop driving when bin is this close (closer for place)
-APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
-SPIN_SPEED      = 0.3   # rad/s
+APPROACH_SPEED  = 0.04  # m/s — forward speed during approach
+SPIN_SPEED      = 0.2   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
 

@@ -109,8 +109,8 @@ RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
 VERTICAL_TOL    = 60    # px  — stop tilting: |cy − CENTER_Y| < this
 
 APPROACH_DIST   = 0.50  # m   — stop driving when object is this close
-APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
-SPIN_SPEED      = 0.3   # rad/s
+APPROACH_SPEED  = 0.04  # m/s — forward speed during approach
+SPIN_SPEED      = 0.2   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
 TILT_GAIN       = 0.001 # rad / px
