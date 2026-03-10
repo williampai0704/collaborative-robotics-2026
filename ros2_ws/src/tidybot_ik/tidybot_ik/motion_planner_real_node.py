@@ -66,17 +66,6 @@ class MotionPlannerRealNode(Node):
 
         # Declare parameters for IK solver, tolerances, and safety margins
         self.declare_parameter('urdf_path', '')
-<<<<<<< HEAD
-        self.declare_parameter('ik_dt', 0.3)  # Step size for numerical IK
-        self.declare_parameter('ik_max_iterations', 200)  # More iterations
-        self.declare_parameter('position_tolerance', 0.03)  # 3cm
-        self.declare_parameter('orientation_tolerance', 0.1)  # ~6 deg
-        self.declare_parameter('min_collision_distance', 0.05)  # 5cm
-        self.declare_parameter('ik_damping', 1e-5)  # Less damping for better convergence
-        self.declare_parameter('max_ik_seeds', 7)  # Max number of IK seeds to try
-        self.declare_parameter('use_taught_config', True)   # Use taught warm-start config
-        self.declare_parameter('taught_config_path', '')    # Path to taught_configs.yaml
-=======
         self.declare_parameter('ik_dt', 0.3)
         self.declare_parameter('ik_max_iterations', 200)
         self.declare_parameter('position_tolerance', 0.01)
@@ -87,7 +76,6 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('workspace_min', [-0.2, -0.5, 0.0])
         self.declare_parameter('workspace_max', [0.8, 0.5, 0.8])
         self.declare_parameter('workspace_frame', 'base_link')
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
 
         # Retrieve parameters
         urdf_path_param = self.get_parameter('urdf_path').get_parameter_value().string_value
@@ -201,24 +189,9 @@ class MotionPlannerRealNode(Node):
         # Gripper controller for grasp-after-descend (SDK mode, left arm)
         self.left_gripper = GripperController(self, mode='sdk')
 
-<<<<<<< HEAD
-        # Load taught joint configs (warm-start seeds)
-        self.taught_configs: dict = self._load_taught_configs(taught_config_path_param)
-
-        self.get_logger().info('Motion planner (real hardware) initialized')
-        self.get_logger().info('Service: /plan_to_target')
-        if self.use_taught_config:
-            loaded = list(self.taught_configs.keys())
-            self.get_logger().info(
-                f'Warm-start IK: ENABLED — taught configs loaded for arms: {loaded}'
-            )
-        else:
-            self.get_logger().info('Warm-start IK: DISABLED (use_taught_config=False)')
-=======
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
         self.get_logger().info('Motion planner (real hardware) initialized with 2-step Hover & Descend logic.')
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
 
     def _process_xacro(self, xacro_path: Path) -> str:
         if xacro_path.suffix == '.xacro':
@@ -463,12 +436,8 @@ class MotionPlannerRealNode(Node):
             response.success, response.message = False, f"Invalid mode '{mode}'. Use 'pick' or 'place'."
             return response
 
-<<<<<<< HEAD
-        # Get current joint positions (for collision context and trajectory start)
-=======
         self.get_logger().info(f'Starting 2-Step Planning for {arm_name} arm (mode={mode})...')
         # Capture starting joint positions before any motion
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
         start_q = self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
         primary_seed = self.get_arm_joint_positions(arm_name)
         other_arm = 'left' if arm_name == 'right' else 'right'
@@ -481,28 +450,6 @@ class MotionPlannerRealNode(Node):
         hover_target_se3 = self.pose_to_se3(request.target_pose)
         hover_target_se3.translation[2] = 0.5
 
-<<<<<<< HEAD
-        # Determine warm-start seed (taught config) if available.
-        # The taught config is used as the *first* seed so IK converges from
-        # a known-good physical configuration near the workspace region.
-        warm_seed = None
-        if self.use_taught_config and arm_name in self.taught_configs:
-            arm_cfgs = self.taught_configs[arm_name]
-            # 'pick' is used for all motions for now; extend later if needed.
-            warm_seed = arm_cfgs.get('pick', arm_cfgs.get('place'))
-            if warm_seed is not None:
-                self.get_logger().info(
-                    f'Using warm-start seed for {arm_name}: '
-                    f'[{", ".join(f"{v:+.4f}" for v in warm_seed)}]'
-                )
-
-        # Build seed list: warm-start first (if any), then current pose, then extras.
-        # For the left arm, mirror the waist and forearm_roll signs on extra seeds.
-        seeds = []
-        if warm_seed is not None:
-            seeds.append(warm_seed.copy())
-        seeds.append(primary_seed)
-=======
         if not self.is_in_workspace(hover_target_se3.translation) or not self.is_in_workspace(final_target_se3.translation):
             response.success, response.message = False, 'Hover or Final target is out of safe workspace bounds.'
             self.get_logger().warn(response.message)
@@ -513,7 +460,6 @@ class MotionPlannerRealNode(Node):
         # =========================================================
         self.get_logger().info('Phase 1: Planning approach to Hover (z=0.5)')
         seeds = [primary_seed]
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
         for extra in self.EXTRA_SEEDS:
             if arm_name == 'left':
                 mirrored = extra.copy()
@@ -589,26 +535,6 @@ class MotionPlannerRealNode(Node):
         response.joint_positions = final_solution.tolist()
 
         if request.execute:
-<<<<<<< HEAD
-            if warm_seed is not None:
-                # Two-step warm-start execution:
-                #   Step 1: current joints  → taught config  (duration seconds)
-                #   Step 2: taught config   → IK solution    (duration seconds)
-                self.get_logger().info(
-                    f'Warm-start execution step 1/2: '
-                    f'current → taught config ({request.duration:.1f}s)'
-                )
-                self.execute_trajectory(arm_name, warm_seed, request.duration, from_q=start_q)
-                self.get_logger().info(
-                    f'Warm-start execution step 2/2: '
-                    f'taught config → IK target ({request.duration:.1f}s)'
-                )
-                self.execute_trajectory(arm_name, solution, request.duration, from_q=warm_seed)
-            else:
-                self.execute_trajectory(arm_name, solution, request.duration)
-            response.executed = True
-            self.get_logger().info(f'Executed motion (warm_seed={warm_seed is not None})')
-=======
             # Run sequence in a thread so we can join it without blocking the executor's
             # main spin loop (requires MultiThreadedExecutor in main()).
             grasp_result = [False]
@@ -625,37 +551,15 @@ class MotionPlannerRealNode(Node):
             response.grasped = grasp_result[0]
             # response.grasped = True # HACK: right arm encoder is broken. left arm seems to have another bug. we choose right arm and just return True for now to allow testing the full pipeline without grasp detection blocking us. This will be fixed in the next iteration.
             self.get_logger().info(f'Execution complete. grasped={response.grasped}')
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
         else:
             response.executed = False
             response.grasped = False
 
         return response
 
-<<<<<<< HEAD
-    def execute_trajectory(self, arm_name: str, target: np.ndarray, duration: float,
-                           from_q: 'np.ndarray | None' = None):
-        """Execute trajectory by interpolating from start to target position.
-
-        Args:
-            arm_name: 'left' or 'right'
-            target: target joint positions (6-DOF)
-            duration: motion duration in seconds
-            from_q: explicit start configuration; if None, reads current joint states
-        """
-        import time
-
-        # Get starting joint positions
-        start = from_q if from_q is not None else self.get_arm_joint_positions(arm_name, use_default_if_zero=False)
-
-        # Interpolation parameters
-        rate_hz = 50.0  # Command rate
-        dt = 1.0 / rate_hz
-=======
     # [NEW] Helper function to execute a single motion segment
     def _execute_motion_step(self, arm_name: str, start_q: np.ndarray, target_q: np.ndarray, duration: float):
         rate_hz, dt = 50.0, 1.0 / 50.0
->>>>>>> d15237fa4050edd221f1ed4c598c5da5a0e12caa
         num_steps = max(int(duration * rate_hz), 1)
 
         for i in range(num_steps + 1):
