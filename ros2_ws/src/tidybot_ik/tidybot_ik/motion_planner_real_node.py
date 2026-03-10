@@ -488,8 +488,8 @@ class MotionPlannerRealNode(Node):
             exec_thread.start()
             exec_thread.join()  # Block this service callback until sequence + grasp done
             response.executed = True
-            # response.grasped = grasp_result[0]
-            response.grasped = True # HACK: right arm encoder is broken. left arm seems to have another bug. we choose right arm and just return True for now to allow testing the full pipeline without grasp detection blocking us. This will be fixed in the next iteration.
+            response.grasped = grasp_result[0]
+            # response.grasped = True # HACK: right arm encoder is broken. left arm seems to have another bug. we choose right arm and just return True for now to allow testing the full pipeline without grasp detection blocking us. This will be fixed in the next iteration.
             self.get_logger().info(f'Execution complete. grasped={response.grasped}')
         else:
             response.executed = False
