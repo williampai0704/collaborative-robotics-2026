@@ -318,7 +318,7 @@ class Task2Node(Node):
 
         out = PoseStamped()
         out.header = poses[-1].header
-        out.pose.position.x = float(mean_pos[0])
+        out.pose.position.x = float(mean_pos[0]) + 0.01
         out.pose.position.y = float(mean_pos[1])
         out.pose.position.z = float(mean_pos[2])
         out.pose.orientation.x = float(mean_quat[0])
