@@ -49,6 +49,8 @@ install(PROGRAMS
   scripts/task_1.py
   scripts/task_2.py
   scripts/task_3.py
+  scripts/task_4.py
+  scripts/task_5.py
   # Vision scripts
   scripts/vision/find_center.py
   scripts/vision/color_mask.py

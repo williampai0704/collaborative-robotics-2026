@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Task 3: Place multiple colored blocks into one bin in a specified order.
+Task 4: Repeatedly listen for voice commands, each specifying ONE block → ONE bin.
 
-This script is SELF-CONTAINED — it automatically launches and manages all
-vision nodes internally. You do NOT need to start find_center, obj_dist, or
-simple_pose_fit manually.
+Unlike task_3 (multiple blocks → one shared bin, one speech command), task_4 re-listens
+after every successful place cycle so each block-bin pair is commanded individually.
 
 ─── Prerequisites (must already be running) ───────────────────────────────────
 1. Real robot hardware:
@@ -13,63 +12,44 @@ simple_pose_fit manually.
 2. Motion planner:
        ros2 run tidybot_ik motion_planner_real_node
 
-─── Run task_3 ────────────────────────────────────────────────────────────────
-Default (red then blue then yellow → green bin, left arm):
-    ros2 run tidybot_bringup task_3.py
+─── Run task_4 ────────────────────────────────────────────────────────────────
+    ros2 run tidybot_bringup task_4.py
 
-Custom colors / arm:
-    ros2 run tidybot_bringup task_3.py \
-        --ros-args -p block_colors:=red,blue,purple -p bin_color:=green -p arm_name:=left
+Custom arm:
+    ros2 run tidybot_bringup task_4.py --ros-args -p arm_name:=right
 
-Speech mode (say e.g. "place the red, blue, and purple blocks in the green bin"):
-    ros2 run tidybot_bringup task_3.py \
-        --ros-args -p use_speech:=true
-
-Available colors:  red, green, blue, yellow, orange, purple
-Available arms:    left, right
-
-─── What this script does automatically ───────────────────────────────────────
-For each block in the specified order:
-  Phase 1 — Find & Pick block (current block_color):
-    • Launches/switches vision nodes to target_color=current_block
-    • Spins robot until block is centred, approaches, estimates pose
-    • Calls /plan_to_target (mode=pick) — arm opens gripper, descends, grasps,
-      returns home; retries up to 3 times if grasp fails
-
-  Phase 2 — Find & Place in bin (bin_color):
-    • Switches vision nodes to target_color=bin_color
-    • Spins robot until bin is centred, approaches, estimates pose
-    • Calls /plan_to_target (mode=place) — arm descends with block, opens
-      gripper to release, returns home
-
-  Repeats for next block in queue until all blocks are placed.
+─── What this script does ─────────────────────────────────────────────────────
+Loop:
+  1. WAIT_SPEECH — listen for "put the <block> block in the <bin> bin"
+     • Say "done" / "stop" / "finish" to end the loop.
+     • If SPEECH_TIMEOUT elapses with no command → DONE (if ≥1 task completed)
+       or ERROR (if nothing was ever placed).
+  2. Find & Pick the specified block (same pipeline as task_3).
+  3. Find & Place in the specified bin.
+  4. Go back to step 1.
 
 ─── State machine ─────────────────────────────────────────────────────────────
-  WAIT_SPEECH    (optional) listen for voice command to set block order + bin
+  WAIT_SPEECH  listen; "done" or timeout→DONE; valid pair→FIND_BLOCK
     ↓
-  FIND_BLOCK     spin until current block centred horizontally
-    ↓ (h_err < HORIZONTAL_TOL)
-  APPROACH_BLOCK drive forward with heading correction; stop at APPROACH_DIST
-    ↑ (drift > RECENTER_TOL)  → back to FIND_BLOCK
-    ↓ (distance ≤ APPROACH_DIST)
-  TILT_BLOCK     adjust camera tilt for vertical centering
-    ↓ (v_err < VERTICAL_TOL)
-  WAIT_BLOCK_POSE wait for fresh /object_pose from simple_pose_fit
+  FIND_BLOCK   spin to centre block
     ↓
-  GRASP          call /plan_to_target (mode=pick); retry up to 3x if grasped=False
-    ↓ (success + grasped)
-  FIND_BIN       switch vision to bin_color; spin to find bin
+  APPROACH_BLOCK
     ↓
-  APPROACH_BIN   same approach logic
-    ↑ (drift)    → back to FIND_BIN
+  TILT_BLOCK
     ↓
-  TILT_BIN       centre bin vertically
+  WAIT_BLOCK_POSE
     ↓
-  WAIT_BIN_POSE  wait for fresh /object_pose
+  GRASP        pick block; switch vision to bin_color → FIND_BIN
     ↓
-  PLACE          call /plan_to_target (mode=place)
-    ↓ (more blocks left) → switch vision to next block_color → FIND_BLOCK
-    ↓ (all blocks done)  → DONE
+  FIND_BIN
+    ↓
+  APPROACH_BIN
+    ↓
+  TILT_BIN
+    ↓
+  WAIT_BIN_POSE
+    ↓
+  PLACE        place block → re-launch speech → WAIT_SPEECH
   DONE / ERROR
 """
 
@@ -96,7 +76,7 @@ from scipy.spatial.transform import Rotation as ScipyRotation
 from tidybot_msgs.srv import PlanToTarget
 
 # =============================================================================
-# Configuration
+# Configuration  (keep in sync with task_3.py)
 # =============================================================================
 
 IMAGE_WIDTH   = 640
@@ -104,47 +84,52 @@ IMAGE_HEIGHT  = 480
 CENTER_X      = IMAGE_WIDTH  / 2.0
 CENTER_Y      = IMAGE_HEIGHT / 2.0
 
-HORIZONTAL_TOL  = 50    # px  — stop spinning: |cx − CENTER_X| < this
-RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
-VERTICAL_TOL    = 60    # px  — stop tilting: |cy − CENTER_Y| < this
+HORIZONTAL_TOL   = 50    # px
+RECENTER_TOL     = 120   # px
+VERTICAL_TOL     = 60    # px
 
-APPROACH_DIST   = 0.50  # m   — stop driving when object is this close
-APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
-SPIN_SPEED      = 0.3   # rad/s
-ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
+APPROACH_DIST    = 0.50  # m
+APPROACH_SPEED   = 0.06  # m/s
+SPIN_SPEED       = 0.3   # rad/s
+ANGULAR_GAIN     = 0.003
 
-TILT_GAIN       = 0.001 # rad / px
-TILT_MIN        = -0.5  # rad
-TILT_MAX        =  0.3  # rad
-TILT_SWEEP_SPEED = 0.012 # rad per loop tick (20 Hz → ~0.16 rad/s sweep)
+TILT_GAIN        = 0.001
+TILT_MIN         = -0.5  # rad
+TILT_MAX         =  0.3  # rad
+TILT_SWEEP_SPEED = 0.012
 
-POSE_WAIT_TIMEOUT  = 4.0   # s — additional wait after settle for pose samples
-SETTLE_TIME        = 1.0   # s — wait for robot to stop moving before accepting poses
-NUM_POSE_SAMPLES   = 5    # number of pose samples to average for robust estimate
-RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target (includes execution)
-MAX_GRASP_RETRIES  = 3
-GRASP_Z            = 0.07  # fixed grasp/place height in base_link frame (m)
-MOTION_DURATION    = 3.0   # s — time for each arm motion segment (hover→target, etc.)
+POSE_WAIT_TIMEOUT = 4.0   # s
+SETTLE_TIME       = 1.0   # s
+NUM_POSE_SAMPLES  = 5
+RESULT_TIMEOUT    = 30.0  # s
+MAX_GRASP_RETRIES = 3
+GRASP_Z           = 0.07  # m
+MOTION_DURATION   = 3.0   # s
 
-# Calibration offsets applied to every IK target (metres, base_link frame).
-# Tune these to correct systematic camera / hardware errors.
-#   X = forward/back   Y = left/right   Z = up/down (adds to GRASP_Z)
-GRASP_OFFSET_X     = 0.0
-GRASP_OFFSET_Y     = 0.0
-GRASP_OFFSET_Z     = 0.0
+GRASP_OFFSET_X    = 0.0
+GRASP_OFFSET_Y    = 0.0
+GRASP_OFFSET_Z    = 0.0
 
-SPEECH_TIMEOUT     = 60.0  # s — give up waiting for voice command after this
+SPEECH_TIMEOUT    = 60.0  # s
 
-# Gemini prompt for task_3: extracts ordered block list + single bin color.
-# object_color is returned as a comma-separated ordered list (e.g. "red,blue,purple").
-TASK3_EXTRACTION_PROMPT = (
+# Valid color names accepted by color_mask.py
+VALID_COLORS = {'red', 'green', 'blue', 'yellow', 'orange', 'purple'}
+
+# Words Gemini may return to signal "I'm done"
+DONE_SIGNALS = {'done', 'stop', 'finish', 'finished', 'exit', 'quit', 'end'}
+
+# Gemini prompt: extract ONE block color and ONE bin color per command.
+# Returns {"object_color": "done", "bin_color": "done"} for stop signals.
+TASK4_EXTRACTION_PROMPT = (
     "Given the instruction, extract two things: "
-    "1) 'bin_color': the single target bin color (one word). "
-    "2) 'object_color': the ordered list of block colors as a comma-separated string "
-    "with no spaces (e.g. 'red,blue,purple'). "
-    "Return only a JSON object with exactly these two keys. "
-    "If a value cannot be determined, use 'unknown'. "
-    "Example output: {\"object_color\": \"red,blue,purple\", \"bin_color\": \"green\"} "
+    "1) 'object_color': the single block color to pick (one word). "
+    "2) 'bin_color': the single bin color to place into (one word). "
+    "Only use these exact color names: red, green, blue, yellow, orange, purple. "
+    "If the user says 'done', 'stop', 'finish', 'that\\'s all', or any similar "
+    "phrase indicating they are finished, return "
+    "{\"object_color\": \"done\", \"bin_color\": \"done\"}. "
+    "Return only a JSON object. If a value cannot be determined, use 'unknown'. "
+    "Example output: {\"object_color\": \"red\", \"bin_color\": \"green\"} "
     "Instruction: "
 )
 
@@ -153,48 +138,38 @@ TASK3_EXTRACTION_PROMPT = (
 # =============================================================================
 
 class State(Enum):
-    WAIT_SPEECH    = auto()   # (optional) wait for /speech_extraction
-    # ── Per-block loop ────────────────────────────────────────────────────────
-    FIND_BLOCK     = auto()   # spin to centre current block horizontally
-    APPROACH_BLOCK = auto()   # drive forward; stop when close enough
-    TILT_BLOCK     = auto()   # centre block vertically in camera
-    WAIT_BLOCK_POSE= auto()   # wait for fresh /object_pose
-    GRASP          = auto()   # call /plan_to_target (mode=pick)
-    # ── Bin ───────────────────────────────────────────────────────────────────
-    FIND_BIN       = auto()   # spin to centre bin horizontally
-    APPROACH_BIN   = auto()   # drive forward; stop when close enough
-    TILT_BIN       = auto()   # centre bin vertically in camera
-    WAIT_BIN_POSE  = auto()   # wait for fresh /object_pose
-    PLACE          = auto()   # call /plan_to_target (mode=place)
-    # ─────────────────────────────────────────────────────────────────────────
+    WAIT_SPEECH    = auto()
+    FIND_BLOCK     = auto()
+    APPROACH_BLOCK = auto()
+    TILT_BLOCK     = auto()
+    WAIT_BLOCK_POSE= auto()
+    GRASP          = auto()
+    FIND_BIN       = auto()
+    APPROACH_BIN   = auto()
+    TILT_BIN       = auto()
+    WAIT_BIN_POSE  = auto()
+    PLACE          = auto()
     DONE           = auto()
     ERROR          = auto()
 
 # =============================================================================
-# Task 3 Node
+# Task 4 Node
 # =============================================================================
 
-class Task3Node(Node):
+class Task4Node(Node):
 
     def __init__(self):
-        super().__init__('task_3')
+        super().__init__('task_4')
 
         # ── Parameters ──────────────────────────────────────────────────────
-        self.declare_parameter('block_colors', 'red,blue,yellow')  # comma-separated ordered list
-        self.declare_parameter('bin_color',    'green')
-        self.declare_parameter('arm_name',     'left')
-        self.declare_parameter('use_speech',   False)
+        self.declare_parameter('arm_name', 'left')
 
-        block_colors_param: str = self.get_parameter('block_colors').value
-        self.bin_color:   str   = self.get_parameter('bin_color').value
-        self.arm_name:    str   = self.get_parameter('arm_name').value
-        self.use_speech:  bool  = self.get_parameter('use_speech').value
+        self.arm_name: str = self.get_parameter('arm_name').value
 
-        # Parse ordered block list
-        self._block_queue: List[str] = [
-            c.strip() for c in block_colors_param.split(',') if c.strip()
-        ]
-        self._block_idx: int = 0   # index into _block_queue
+        # ── Per-command state (filled by _speech_cb each iteration) ─────────
+        self.current_block_color: str = ''
+        self.current_bin_color:   str = ''
+        self._tasks_completed:    int = 0
 
         # ── Callback groups ──────────────────────────────────────────────────
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
@@ -214,6 +189,10 @@ class Task3Node(Node):
         self.create_subscription(Float32,     '/vision/object_distance', self._obj_dist_cb,    10)
         self.create_subscription(PoseStamped, '/object_pose',            self._object_pose_cb, 10)
 
+        from tidybot_msgs.msg import SpeechExtraction
+        self.create_subscription(
+            SpeechExtraction, '/speech_extraction', self._speech_cb, 10)
+
         # ── TF2 ─────────────────────────────────────────────────────────────
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -226,61 +205,34 @@ class Task3Node(Node):
 
         self._cmd_pan:        float = 0.0
         self._cmd_tilt:       float = 0.0
-        self._tilt_sweep_dir: float = -1.0  # -1 = sweep down, +1 = sweep up
+        self._tilt_sweep_dir: float = -1.0
         self._grasp_retries:  int   = 0
 
         self._pending_future = None
-        self._pose_samples: list = []  # collected pose samples for averaging
+        self._pose_samples: list = []
         self._vision_procs: List[subprocess.Popen] = []
         self._speech_proc:  Optional[subprocess.Popen] = None
 
-        # ── Optional speech subscription ─────────────────────────────────────
-        if self.use_speech:
-            from tidybot_msgs.msg import SpeechExtraction
-            self.create_subscription(
-                SpeechExtraction, '/speech_extraction', self._speech_cb, 10)
-
-        # ── Initial state ────────────────────────────────────────────────────
-        if self.use_speech:
-            self.state = State.WAIT_SPEECH
-            self._speech_proc = subprocess.Popen([
-                'ros2', 'run', 'tidybot_bringup', 'speech_extraction_node.py',
-                '--ros-args', '-p', f'extraction_prompt:={TASK3_EXTRACTION_PROMPT}',
-            ])
-        else:
-            self.state = State.FIND_BLOCK
-            self._start_vision_nodes(self._current_block)
-
+        # ── Initial state: always starts in WAIT_SPEECH ──────────────────────
+        self.state       = State.WAIT_SPEECH
         self.state_start = time.time()
+        self._launch_speech_node()
+
         self.create_timer(0.05, self._loop)  # 20 Hz
 
         self.get_logger().info('=' * 65)
-        self.get_logger().info('Task 3: Place blocks in order into one bin')
-        self.get_logger().info(f'  Block order : {self._block_queue}')
-        self.get_logger().info(f'  Bin color   : {self.bin_color}')
-        self.get_logger().info(f'  Arm         : {self.arm_name}')
-        self.get_logger().info(f'  use_speech  : {self.use_speech}')
+        self.get_logger().info('Task 4: Repeated speech-commanded pick-and-place')
+        self.get_logger().info(f'  Arm: {self.arm_name}')
+        self.get_logger().info('  Say: "put the <block> block in the <bin> bin"')
+        self.get_logger().info('  Say: "done" / "stop" to finish.')
         self.get_logger().info('=' * 65)
-
-    # =========================================================================
-    # Properties
-    # =========================================================================
-
-    @property
-    def _current_block(self) -> str:
-        """Color of the block currently being picked."""
-        return self._block_queue[self._block_idx]
-
-    @property
-    def _blocks_remaining(self) -> int:
-        return len(self._block_queue) - self._block_idx
 
     # =========================================================================
     # Callbacks
     # =========================================================================
 
     def _speech_cb(self, msg):
-        """Receive voice command: ordered block list + bin color."""
+        """Receive one block→bin command (or stop signal)."""
         if self.state != State.WAIT_SPEECH:
             return
         if not msg.success:
@@ -288,19 +240,36 @@ class Task3Node(Node):
                 f'Speech extraction failed: {msg.error_message} — still waiting...')
             return
 
-        # object_color holds comma-separated ordered block list
-        raw_blocks = msg.object_color.strip()
-        self._block_queue = [c.strip() for c in raw_blocks.split(',') if c.strip()]
-        self.bin_color     = msg.bin_color.strip()
-        self._block_idx    = 0
+        block_color = msg.object_color.strip().lower()
+        bin_color   = msg.bin_color.strip().lower()
 
-        self.get_logger().info(f'[Speech] block order={self._block_queue}  bin={self.bin_color}')
+        # Explicit stop signal
+        if block_color in DONE_SIGNALS or bin_color in DONE_SIGNALS:
+            self.get_logger().info(
+                f'[Speech] Stop signal received after {self._tasks_completed} task(s) → DONE')
+            if self._speech_proc is not None:
+                self._speech_proc.terminate()
+                self._speech_proc = None
+            self._transition(State.DONE)
+            return
+
+        # Validate colors
+        if block_color not in VALID_COLORS or bin_color not in VALID_COLORS:
+            self.get_logger().warn(
+                f'[Speech] Unrecognized colors: block="{block_color}" bin="{bin_color}" '
+                f'— still waiting...')
+            return
+
+        self.current_block_color = block_color
+        self.current_bin_color   = bin_color
+        self.get_logger().info(
+            f'[Speech] Command: [{block_color}] block → [{bin_color}] bin')
 
         if self._speech_proc is not None:
             self._speech_proc.terminate()
             self._speech_proc = None
 
-        self._start_vision_nodes(self._current_block)
+        self._switch_vision(block_color)
         self._transition(State.FIND_BLOCK)
 
     def _mask_center_cb(self, msg: Point):
@@ -340,7 +309,6 @@ class Task3Node(Node):
         self.pan_tilt_pub.publish(msg)
 
     def _start_vision_nodes(self, color: str):
-        """Stop running vision nodes and relaunch with new target color."""
         self._stop_vision_nodes()
         for script in ['find_center.py', 'obj_dist.py', 'simple_pose_fit.py']:
             proc = subprocess.Popen([
@@ -360,7 +328,6 @@ class Task3Node(Node):
         self._vision_procs = []
 
     def _switch_vision(self, color: str):
-        """Switch vision nodes to a new color and clear stale sensor data."""
         msg = String()
         msg.data = color
         self.color_pub.publish(msg)
@@ -369,23 +336,29 @@ class Task3Node(Node):
         self.pose_timestamp = None
         self._start_vision_nodes(color)
 
+    def _launch_speech_node(self):
+        """(Re-)launch the speech extraction subprocess."""
+        if self._speech_proc is not None:
+            self._speech_proc.terminate()
+            self._speech_proc = None
+        self._speech_proc = subprocess.Popen([
+            'ros2', 'run', 'tidybot_bringup', 'speech_extraction_node.py',
+            '--ros-args', '-p', f'extraction_prompt:={TASK4_EXTRACTION_PROMPT}',
+        ])
+        self.get_logger().info('[Speech] Listening for next command...')
+
     def _average_poses(self, poses: list) -> PoseStamped:
-        """Average multiple PoseStamped messages (position mean + quaternion mean)."""
         positions = np.array([[p.pose.position.x, p.pose.position.y, p.pose.position.z]
                               for p in poses])
         quats = np.array([[p.pose.orientation.x, p.pose.orientation.y,
                            p.pose.orientation.z, p.pose.orientation.w]
                           for p in poses])
-
         mean_pos = positions.mean(axis=0)
-
-        # Flip quaternions to same hemisphere before averaging
         for i in range(1, len(quats)):
             if np.dot(quats[i], quats[0]) < 0:
                 quats[i] = -quats[i]
         mean_quat = quats.mean(axis=0)
         mean_quat /= np.linalg.norm(mean_quat)
-
         out = PoseStamped()
         out.header = poses[-1].header
         out.pose.position.x = float(mean_pos[0]) + 0.01
@@ -402,28 +375,12 @@ class Task3Node(Node):
         self.state       = new_state
         self.state_start = time.time()
         self._pending_future = None
-        self._pose_samples.clear()   # clear stale samples from previous wait
+        self._pose_samples.clear()
 
     def _elapsed(self) -> float:
         return time.time() - self.state_start
 
-    def _advance_to_next_block(self):
-        """Move to the next block in queue, or finish if queue exhausted."""
-        self._block_idx    += 1
-        self._grasp_retries = 0
-        if self._block_idx < len(self._block_queue):
-            next_color = self._current_block
-            self.get_logger().info(
-                f'Block {self._block_idx}/{len(self._block_queue)}: '
-                f'switching to [{next_color}]')
-            self._set_pan_tilt(0.0, 0.0)
-            self._switch_vision(next_color)
-            self._transition(State.FIND_BLOCK)
-        else:
-            self._transition(State.DONE)
-
     def _transform_to_base(self, pose_cam: PoseStamped) -> Optional[PoseStamped]:
-        """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 'base_link', 'camera_color_optical_frame',
@@ -481,13 +438,12 @@ class Task3Node(Node):
         return True
 
     # =========================================================================
-    # Shared sub-behaviours (identical to task_2)
+    # Shared sub-behaviours (identical to task_3)
     # =========================================================================
 
     def _do_find(self, next_state: State):
         mc = self.mask_center
         if mc is None:
-            # Target not visible — spin and sweep tilt to search
             self._spin()
             new_tilt = self._cmd_tilt + self._tilt_sweep_dir * TILT_SWEEP_SPEED
             if new_tilt <= TILT_MIN:
@@ -500,7 +456,6 @@ class Task3Node(Node):
             return
         h_err = mc.x - CENTER_X
         v_err = mc.y - CENTER_Y
-        # Track target vertically while aligning horizontally
         self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         self.get_logger().info(
             f'[{self.state.name}] cx={mc.x:.0f}  h_err={h_err:+.0f}  v_err={v_err:+.0f} px',
@@ -521,7 +476,6 @@ class Task3Node(Node):
             return
         h_err = mc.x - CENTER_X
         v_err = mc.y - CENTER_Y
-        # Continuously tilt to keep target vertically centred while driving
         self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         if abs(h_err) > RECENTER_TOL:
             self._stop()
@@ -561,23 +515,12 @@ class Task3Node(Node):
             self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
 
     def _do_wait_pose(self, next_state: State):
-        """Wait for robot to settle, then collect and average pose samples.
-
-        Phase 1 (0 → SETTLE_TIME): let vibrations die down after stopping.
-        Phase 2 (SETTLE_TIME → SETTLE_TIME+POSE_WAIT_TIMEOUT): collect
-          NUM_POSE_SAMPLES fresh poses from simple_pose_fit and average them
-          for a more robust estimate before handing off to manipulation.
-        """
         elapsed = self._elapsed()
-
-        # Phase 1: settle
         if elapsed < SETTLE_TIME:
             self.get_logger().info(
                 f'[{self.state.name}] Settling … ({elapsed:.1f} / {SETTLE_TIME:.0f} s)',
                 throttle_duration_sec=0.5)
             return
-
-        # Phase 2: collect samples
         if self.pose_timestamp is not None and \
                 self.pose_timestamp >= self.state_start + SETTLE_TIME:
             if len(self._pose_samples) == 0 or \
@@ -586,29 +529,23 @@ class Task3Node(Node):
                 self.get_logger().info(
                     f'[{self.state.name}] Pose sample '
                     f'{len(self._pose_samples)}/{NUM_POSE_SAMPLES}')
-
         if len(self._pose_samples) >= NUM_POSE_SAMPLES:
-            self.object_pose = self._average_poses(
-                [s[1] for s in self._pose_samples])
+            self.object_pose = self._average_poses([s[1] for s in self._pose_samples])
             self._pose_samples.clear()
             self.get_logger().info(f'[{self.state.name}] Averaged pose computed')
             self._transition(next_state)
             return
-
         total_timeout = SETTLE_TIME + POSE_WAIT_TIMEOUT
         if elapsed > total_timeout:
             if len(self._pose_samples) > 0:
                 self.get_logger().warn(
                     f'[{self.state.name}] Timed out with {len(self._pose_samples)} '
                     f'samples – using partial average')
-                self.object_pose = self._average_poses(
-                    [s[1] for s in self._pose_samples])
+                self.object_pose = self._average_poses([s[1] for s in self._pose_samples])
                 self._pose_samples.clear()
                 self._transition(next_state)
             else:
-                self.get_logger().error(
-                    'Timed out waiting for /object_pose. '
-                    'Is simple_pose_fit.py running with the correct color?')
+                self.get_logger().error('Timed out waiting for /object_pose.')
                 self._transition(State.ERROR)
         else:
             self.get_logger().info(
@@ -624,7 +561,6 @@ class Task3Node(Node):
                             retry_count_attr: str = ''):
         elapsed = self._elapsed()
 
-        # Send request once on entry
         if self._pending_future is None and elapsed < 0.2:
             pose_base = self._transform_to_base(self.object_pose)
             if pose_base is None:
@@ -644,7 +580,6 @@ class Task3Node(Node):
                 f'pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) m')
             return
 
-        # Poll future
         if self._pending_future is not None:
             if not self._pending_future.done():
                 if elapsed > RESULT_TIMEOUT:
@@ -659,8 +594,7 @@ class Task3Node(Node):
             pick_failed = mode == 'pick' and result.success and not result.grasped
 
             if result.success and not pick_failed:
-                self.get_logger().info(
-                    f'[{self.state.name}] Succeeded: {result.message}')
+                self.get_logger().info(f'[{self.state.name}] Succeeded: {result.message}')
                 self._transition(success_state)
             else:
                 if pick_failed:
@@ -689,24 +623,24 @@ class Task3Node(Node):
         # ── WAIT_SPEECH ──────────────────────────────────────────────────────
         if self.state == State.WAIT_SPEECH:
             if elapsed > SPEECH_TIMEOUT:
-                self.get_logger().error(
-                    f'Speech timeout — falling back to params: '
-                    f'blocks={self._block_queue}, bin={self.bin_color}')
+                if self._tasks_completed > 0:
+                    self.get_logger().info(
+                        f'Speech timeout — {self._tasks_completed} task(s) completed → DONE')
+                else:
+                    self.get_logger().warn('Speech timeout with no tasks completed → DONE')
                 if self._speech_proc is not None:
                     self._speech_proc.terminate()
                     self._speech_proc = None
-                self._start_vision_nodes(self._current_block)
-                self._transition(State.FIND_BLOCK)
+                self._transition(State.DONE)
             else:
                 self.get_logger().info(
-                    f'Listening for voice command... ({elapsed:.0f}s / {SPEECH_TIMEOUT:.0f}s)',
+                    f'Listening... ({elapsed:.0f}s / {SPEECH_TIMEOUT:.0f}s)',
                     throttle_duration_sec=5.0)
 
         # ── FIND_BLOCK ────────────────────────────────────────────────────────
         elif self.state == State.FIND_BLOCK:
             self.get_logger().info(
-                f'[Block {self._block_idx + 1}/{len(self._block_queue)}] '
-                f'Searching for [{self._current_block}]',
+                f'[Task {self._tasks_completed + 1}] Searching for [{self.current_block_color}]',
                 throttle_duration_sec=2.0)
             self._do_find(next_state=State.APPROACH_BLOCK)
 
@@ -734,16 +668,15 @@ class Task3Node(Node):
                 max_retries=MAX_GRASP_RETRIES,
                 retry_count_attr='_grasp_retries',
             )
-            # On grasp success → switch vision to bin
             if self.state == State.FIND_BIN:
                 self._grasp_retries = 0
                 self._set_pan_tilt(0.0, 0.0)
-                self._switch_vision(self.bin_color)
+                self._switch_vision(self.current_bin_color)
 
         # ── FIND_BIN ──────────────────────────────────────────────────────────
         elif self.state == State.FIND_BIN:
             self.get_logger().info(
-                f'Searching for bin [{self.bin_color}]',
+                f'Searching for [{self.current_bin_color}] bin',
                 throttle_duration_sec=2.0)
             self._do_find(next_state=State.APPROACH_BIN)
 
@@ -764,34 +697,35 @@ class Task3Node(Node):
         # ── PLACE ─────────────────────────────────────────────────────────────
         elif self.state == State.PLACE:
             self._do_plan_to_target(
-                success_state=State.FIND_BLOCK,
+                success_state=State.WAIT_SPEECH,
                 fail_state=State.ERROR,
                 mode='place',
             )
-            # _do_plan_to_target transitions to FIND_BLOCK on success.
-            # Immediately call _advance_to_next_block to either switch vision
-            # to the next block color (→ FIND_BLOCK with fresh state_start) or
-            # finish (→ DONE). Both paths happen within this single _loop tick.
-            if self.state == State.FIND_BLOCK:
-                self._advance_to_next_block()
+            # On place success: increment counter, stop vision, re-launch speech.
+            # All happens within this _loop tick before the next iteration.
+            if self.state == State.WAIT_SPEECH:
+                self._tasks_completed += 1
+                self.get_logger().info(
+                    f'[Task {self._tasks_completed}] '
+                    f'[{self.current_block_color}] → [{self.current_bin_color}] complete!')
+                self._stop_vision_nodes()
+                self._set_pan_tilt(0.0, 0.0)
+                self._launch_speech_node()
 
         # ── DONE ─────────────────────────────────────────────────────────────
         elif self.state == State.DONE:
             if elapsed < 0.1:
                 self.get_logger().info('=' * 65)
-                self.get_logger().info('Task 3 complete!')
                 self.get_logger().info(
-                    f'  Placed {len(self._block_queue)} block(s) '
-                    f'{self._block_queue} → [{self.bin_color}] bin')
+                    f'Task 4 complete — {self._tasks_completed} block(s) placed.')
                 self.get_logger().info('=' * 65)
 
         # ── ERROR ─────────────────────────────────────────────────────────────
         elif self.state == State.ERROR:
             if elapsed < 0.1:
                 self.get_logger().error(
-                    f'Task 3 ended in ERROR at block '
-                    f'{self._block_idx + 1}/{len(self._block_queue)} '
-                    f'[{self._current_block if self._block_idx < len(self._block_queue) else "done"}]')
+                    f'Task 4 ended in ERROR after {self._tasks_completed} task(s). '
+                    f'Last command: [{self.current_block_color}] → [{self.current_bin_color}]')
 
 
 # =============================================================================
@@ -800,7 +734,7 @@ class Task3Node(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = Task3Node()
+    node = Task4Node()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

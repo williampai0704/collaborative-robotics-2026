@@ -132,6 +132,12 @@ class GripperController:
             cmd.name = 'left_gripper'
             self.left_pub.publish(cmd)
 
+    def _get_avg_finger_pos(self, side: str) -> 'float | None':
+        """Return average position of both fingers for the given side, or None if unavailable."""
+        names = FINGER_JOINT_NAMES.get(side, [])
+        positions = [self.finger_positions[n] for n in names if n in self.finger_positions]
+        return sum(positions) / len(positions) if positions else None
+
     def set_position(self, side: str, position: float, duration: float = 2.0):
         """
         Set gripper to a specific position.
@@ -139,7 +145,9 @@ class GripperController:
         Args:
             side: 'right' or 'left'
             position: 0.0 (fully open) to 1.0 (fully closed)
-            duration: Time to publish the command (seconds)
+            duration: Max time to publish the command (seconds).
+                      For opening (position=0.0), the motor also stops early
+                      if the fingers reverse direction (slider-crank overshoot protection).
         """
         position = max(0.0, min(1.0, position))
 
@@ -148,18 +156,39 @@ class GripperController:
             start_time = time.time()
             while (time.time() - start_time) < duration:
                 self._publish_sim(side, position)
-                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
         else:
             # Convert to PWM: 0.0 -> +pwm (open), 1.0 -> -pwm (close)
             pwm = self.pwm_value - position * (2 * self.pwm_value)
+            is_opening = position < 0.5  # positive PWM = opening direction
+
+            # For opening: track finger position to detect slider-crank overshoot.
+            # The mechanism goes past maximum open and starts coming back slightly —
+            # stop the motor the moment the fingers start reversing direction.
+            peak_pos = None
+            REVERSAL_THRESHOLD = 0.001  # m — stop if fingers close by more than 1 mm
+
             start_time = time.time()
             while (time.time() - start_time) < duration:
                 self._publish_sdk(side, pwm)
-                # rclpy.spin_once(self.node, timeout_sec=0.01)
                 time.sleep(0.05)
 
-            # Stop gripper
+                if is_opening:
+                    cur = self._get_avg_finger_pos(side)
+                    if cur is not None:
+                        if peak_pos is None:
+                            peak_pos = cur
+                        elif cur > peak_pos:
+                            peak_pos = cur  # still opening, update peak
+                        elif (peak_pos - cur) >= REVERSAL_THRESHOLD:
+                            # Fingers reversed — past maximum open, stop now
+                            self.node.get_logger().info(
+                                f'Gripper {side}: overshoot detected at peak={peak_pos:.4f}m, '
+                                f'cur={cur:.4f}m — stopping early.'
+                            )
+                            break
+
+            # Stop gripper motor
             self._publish_sdk(side, 0.0)
 
     def open(self, side: str, duration: float = 1.5):

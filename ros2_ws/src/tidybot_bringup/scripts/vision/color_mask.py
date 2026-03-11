@@ -13,7 +13,8 @@ def color_mask(color_img, color_name='r'):
     color_img : np.ndarray
         Input image (RGB or BGR format)
     color_name : string
-        Color to mask: 'r'/'red', 'g'/'green', 'b'/'blue', 'y'/'yellow'
+        Color to mask: 'r'/'red', 'g'/'green', 'b'/'blue', 'y'/'yellow',
+        'o'/'orange', 'p'/'purple'
 
     Returns
     -------
@@ -30,6 +31,10 @@ def color_mask(color_img, color_name='r'):
         color = 'blue'
     elif color in ['y', 'yellow']:
         color = 'yellow'
+    elif color in ['o', 'orange']:
+        color = 'orange'
+    elif color in ['p', 'purple']:
+        color = 'purple'
 
     # Convert to BGR if needed, then to HSV
     if color_img.shape[-1] == 3:
@@ -62,6 +67,18 @@ def color_mask(color_img, color_name='r'):
     elif color == 'yellow':
         lower = np.array([15, 40, 100])
         upper = np.array([35, 255, 255])
+        mask = cv2.inRange(hsv_img, lower, upper)
+    elif color == 'orange':
+        # H=11–25: sits just above red (0–10), well below yellow (15–35 overlaps slightly
+        # but orange has much higher saturation so the S≥100 floor separates them).
+        lower = np.array([11, 100, 50])
+        upper = np.array([25, 255, 255])
+        mask = cv2.inRange(hsv_img, lower, upper)
+    elif color == 'purple':
+        # H=131–160: sits just above blue (90–130).
+        # Covers violet through magenta-purple; S≥50 rejects grey/lavender walls.
+        lower = np.array([131, 50, 40])
+        upper = np.array([160, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
 
     if mask is not None:
