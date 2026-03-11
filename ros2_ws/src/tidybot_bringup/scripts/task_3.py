@@ -118,7 +118,9 @@ TILT_MIN        = -0.5  # rad
 TILT_MAX        =  0.3  # rad
 TILT_SWEEP_SPEED = 0.008 # rad per loop tick (20 Hz → ~0.16 rad/s sweep)
 
-POSE_WAIT_TIMEOUT  = 8.0   # s
+POSE_WAIT_TIMEOUT  = 8.0   # s — additional wait after settle for pose samples
+SETTLE_TIME        = 2.0   # s — wait for robot to stop moving before accepting poses
+NUM_POSE_SAMPLES   = 10    # number of pose samples to average for robust estimate
 RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target (includes execution)
 MAX_GRASP_RETRIES  = 3
 GRASP_Z            = 0.07  # fixed grasp/place height in base_link frame (m)
@@ -219,6 +221,7 @@ class Task3Node(Node):
         self._grasp_retries:  int   = 0
 
         self._pending_future = None
+        self._pose_samples: list = []  # collected pose samples for averaging
         self._vision_procs: List[subprocess.Popen] = []
         self._speech_proc:  Optional[subprocess.Popen] = None
 
@@ -357,11 +360,40 @@ class Task3Node(Node):
         self.pose_timestamp = None
         self._start_vision_nodes(color)
 
+    def _average_poses(self, poses: list) -> PoseStamped:
+        """Average multiple PoseStamped messages (position mean + quaternion mean)."""
+        positions = np.array([[p.pose.position.x, p.pose.position.y, p.pose.position.z]
+                              for p in poses])
+        quats = np.array([[p.pose.orientation.x, p.pose.orientation.y,
+                           p.pose.orientation.z, p.pose.orientation.w]
+                          for p in poses])
+
+        mean_pos = positions.mean(axis=0)
+
+        # Flip quaternions to same hemisphere before averaging
+        for i in range(1, len(quats)):
+            if np.dot(quats[i], quats[0]) < 0:
+                quats[i] = -quats[i]
+        mean_quat = quats.mean(axis=0)
+        mean_quat /= np.linalg.norm(mean_quat)
+
+        out = PoseStamped()
+        out.header = poses[-1].header
+        out.pose.position.x = float(mean_pos[0]) + 0.01
+        out.pose.position.y = float(mean_pos[1])
+        out.pose.position.z = float(mean_pos[2])
+        out.pose.orientation.x = float(mean_quat[0])
+        out.pose.orientation.y = float(mean_quat[1])
+        out.pose.orientation.z = float(mean_quat[2])
+        out.pose.orientation.w = float(mean_quat[3])
+        return out
+
     def _transition(self, new_state: State):
         self.get_logger().info(f'[State] {self.state.name} → {new_state.name}')
         self.state       = new_state
         self.state_start = time.time()
         self._pending_future = None
+        self._pose_samples.clear()   # clear stale samples from previous wait
 
     def _elapsed(self) -> float:
         return time.time() - self.state_start
@@ -518,18 +550,60 @@ class Task3Node(Node):
             self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
 
     def _do_wait_pose(self, next_state: State):
-        if self._elapsed() < 0.3:
+        """Wait for robot to settle, then collect and average pose samples.
+
+        Phase 1 (0 → SETTLE_TIME): let vibrations die down after stopping.
+        Phase 2 (SETTLE_TIME → SETTLE_TIME+POSE_WAIT_TIMEOUT): collect
+          NUM_POSE_SAMPLES fresh poses from simple_pose_fit and average them
+          for a more robust estimate before handing off to manipulation.
+        """
+        elapsed = self._elapsed()
+
+        # Phase 1: settle
+        if elapsed < SETTLE_TIME:
+            self.get_logger().info(
+                f'[{self.state.name}] Settling … ({elapsed:.1f} / {SETTLE_TIME:.0f} s)',
+                throttle_duration_sec=0.5)
             return
-        if self.pose_timestamp is not None and self.pose_timestamp >= self.state_start:
-            self.get_logger().info('Fresh pose received')
+
+        # Phase 2: collect samples
+        if self.pose_timestamp is not None and \
+                self.pose_timestamp >= self.state_start + SETTLE_TIME:
+            if len(self._pose_samples) == 0 or \
+                    self.pose_timestamp > self._pose_samples[-1][0]:
+                self._pose_samples.append((self.pose_timestamp, self.object_pose))
+                self.get_logger().info(
+                    f'[{self.state.name}] Pose sample '
+                    f'{len(self._pose_samples)}/{NUM_POSE_SAMPLES}')
+
+        if len(self._pose_samples) >= NUM_POSE_SAMPLES:
+            self.object_pose = self._average_poses(
+                [s[1] for s in self._pose_samples])
+            self._pose_samples.clear()
+            self.get_logger().info(f'[{self.state.name}] Averaged pose computed')
             self._transition(next_state)
             return
-        if self._elapsed() > POSE_WAIT_TIMEOUT:
-            self.get_logger().error('Timed out waiting for /object_pose')
-            self._transition(State.ERROR)
+
+        total_timeout = SETTLE_TIME + POSE_WAIT_TIMEOUT
+        if elapsed > total_timeout:
+            if len(self._pose_samples) > 0:
+                self.get_logger().warn(
+                    f'[{self.state.name}] Timed out with {len(self._pose_samples)} '
+                    f'samples – using partial average')
+                self.object_pose = self._average_poses(
+                    [s[1] for s in self._pose_samples])
+                self._pose_samples.clear()
+                self._transition(next_state)
+            else:
+                self.get_logger().error(
+                    'Timed out waiting for /object_pose. '
+                    'Is simple_pose_fit.py running with the correct color?')
+                self._transition(State.ERROR)
         else:
             self.get_logger().info(
-                f'Waiting for pose … ({self._elapsed():.1f} / {POSE_WAIT_TIMEOUT:.0f} s)',
+                f'[{self.state.name}] Waiting for pose … '
+                f'({elapsed:.1f} / {total_timeout:.0f} s, '
+                f'samples: {len(self._pose_samples)}/{NUM_POSE_SAMPLES})',
                 throttle_duration_sec=1.0)
 
     def _do_plan_to_target(self, success_state: State, fail_state: State,
