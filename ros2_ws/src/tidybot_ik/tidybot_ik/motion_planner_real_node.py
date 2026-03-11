@@ -471,12 +471,14 @@ class MotionPlannerRealNode(Node):
         # Fall-back path: compute hover via IK to (x, y, z=0.5) as before.
         hover_solution = None
         hover_pos_err, hover_ori_err = 0.0, 0.0
+        used_warm_start = False
 
         if self.use_taught_config and arm_name in self.taught_configs:
             arm_cfgs = self.taught_configs[arm_name]
             warm_seed = arm_cfgs.get(mode, arm_cfgs.get('pick'))
             if warm_seed is not None:
                 hover_solution = warm_seed.copy()
+                used_warm_start = True
                 self.get_logger().info(
                     f'Phase 1 (warm-start): using taught config for {arm_name}/{mode}: '
                     f'[{", ".join(f"{v:+.4f}" for v in hover_solution)}]'
@@ -537,15 +539,26 @@ class MotionPlannerRealNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        # Check Singularity for both solutions
-        cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
+        # Check Singularity
+        # Default threshold raised to 500: real robot Jacobians routinely reach 200-400
+        # even in non-singular configurations; 100 was too tight.
+        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 500.0
         cond_final = self.compute_jacobian_condition(arm_name, final_solution)
-        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 100.0
 
-        if cond_hover > max_cond or cond_final > max_cond:
-            response.success, response.message = False, f"Near singularity detected (cond={max(cond_hover, cond_final):.1f})"
-            self.get_logger().warn(response.message)
-            return response
+        if used_warm_start:
+            # Taught hover config is physically verified — skip its condition check.
+            # Only check the IK-derived final solution.
+            cond_hover = 0.0
+            if cond_final > max_cond:
+                response.success, response.message = False, f"Near singularity in final IK solution (cond={cond_final:.1f} > {max_cond:.0f})"
+                self.get_logger().warn(response.message)
+                return response
+        else:
+            cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
+            if cond_hover > max_cond or cond_final > max_cond:
+                response.success, response.message = False, f"Near singularity detected (hover_cond={cond_hover:.1f}, final_cond={cond_final:.1f}, max={max_cond:.0f})"
+                self.get_logger().warn(response.message)
+                return response
 
         # =========================================================
         # PHASE 3: Path Validation (Collisions)
