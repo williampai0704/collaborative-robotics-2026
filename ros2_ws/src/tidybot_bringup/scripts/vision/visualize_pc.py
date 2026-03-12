@@ -387,7 +387,7 @@ def run_standalone():
     parser = argparse.ArgumentParser(description='Visualize RGB point cloud from test data')
     parser.add_argument('--pair', type=int, default=0, help='Test data pair index (default: 0)')
     parser.add_argument('--mask', type=str, default=None, 
-                       help='Color mask: red, green, blue, yellow')
+                       help='Color mask: red, green, blue, yellow, orange, purple')
     parser.add_argument('--voxel', type=float, default=0.0,
                        help='Voxel size for downsampling (default: 0 = no downsampling)')
     parser.add_argument('--depth-scale', type=float, default=1000.0,

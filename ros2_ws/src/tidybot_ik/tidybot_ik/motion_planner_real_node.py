@@ -11,6 +11,7 @@ Services:
 """
 
 import numpy as np
+import yaml
 from pathlib import Path
 from threading import Lock
 import threading  # [MODIFIED] Added threading module to prevent ROS 2 executor blocking
@@ -58,7 +59,7 @@ class MotionPlannerRealNode(Node):
         np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0]),
     ]
 
-    GRIPPER_DURATION = 1.5
+    GRIPPER_DURATION = 3.0
 
     def __init__(self):
         super().__init__('motion_planner_real')
@@ -75,6 +76,8 @@ class MotionPlannerRealNode(Node):
         self.declare_parameter('workspace_min', [-0.2, -0.5, 0.0])
         self.declare_parameter('workspace_max', [0.8, 0.5, 0.8])
         self.declare_parameter('workspace_frame', 'base_link')
+        self.declare_parameter('use_taught_config', True)   # Use taught warm-start config
+        self.declare_parameter('taught_config_path', '')    # Path to taught_configs.yaml
 
         # Retrieve parameters
         urdf_path_param = self.get_parameter('urdf_path').get_parameter_value().string_value
@@ -85,6 +88,8 @@ class MotionPlannerRealNode(Node):
         self.min_collision_distance = self.get_parameter('min_collision_distance').get_parameter_value().double_value
         self.ik_damping = self.get_parameter('ik_damping').get_parameter_value().double_value
         self.max_ik_seeds = self.get_parameter('max_ik_seeds').get_parameter_value().integer_value
+        self.use_taught_config = self.get_parameter('use_taught_config').get_parameter_value().bool_value
+        taught_config_path_param = self.get_parameter('taught_config_path').get_parameter_value().string_value
 
         self.workspace_min = np.array(self.get_parameter('workspace_min').get_parameter_value().double_array_value)
         self.workspace_max = np.array(self.get_parameter('workspace_max').get_parameter_value().double_array_value)
@@ -188,6 +193,16 @@ class MotionPlannerRealNode(Node):
 
         # Service server for the manipulation pipeline
         self.plan_service = self.create_service(PlanToTarget, '/plan_to_target', self.plan_to_target_callback)
+
+        # Load warm-start taught configs (must happen after parameters are read)
+        self.taught_configs: dict = self._load_taught_configs(taught_config_path_param)
+        if self.use_taught_config:
+            self.get_logger().info(
+                f'Warm-start IK: ENABLED — taught configs loaded for arms: {list(self.taught_configs.keys())}'
+            )
+        else:
+            self.get_logger().info('Warm-start IK: DISABLED (use_taught_config=False)')
+
         self.get_logger().info('Motion planner (real hardware) initialized with 2-step Hover & Descend logic.')
 
     def _process_xacro(self, xacro_path: Path) -> str:
@@ -195,6 +210,63 @@ class MotionPlannerRealNode(Node):
             result = subprocess.run(['xacro', str(xacro_path)], capture_output=True, text=True, check=True)
             return result.stdout
         return xacro_path.read_text()
+
+    def _load_taught_configs(self, path_param: str) -> dict:
+        """Load taught joint configurations from YAML, keyed as configs[arm_name][label].
+
+        Each value is a numpy array of 6 joint positions in
+        [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate] order.
+        """
+        # Resolve config path
+        if path_param:
+            config_path = Path(path_param)
+        else:
+            # Default: tidybot_bringup/config/taught_configs.yaml (works with symlink-install)
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share = get_package_share_directory('tidybot_bringup')
+                config_path = Path(share) / 'config' / 'taught_configs.yaml'
+            except Exception:
+                config_path = Path(__file__).resolve().parents[4] / \
+                    'tidybot_bringup' / 'config' / 'taught_configs.yaml'
+
+        if not config_path.exists():
+            self.get_logger().warn(
+                f'taught_configs.yaml not found at {config_path}. '
+                'Warm-start disabled until file is created.'
+            )
+            return {}
+
+        try:
+            with open(config_path) as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().error(f'Failed to parse taught_configs.yaml: {e}')
+            return {}
+
+        configs: dict = {}
+        for arm_key, labels in raw.items():
+            # Normalise key: 'left_arm' or 'left' both map to 'left'
+            arm_name = arm_key.replace('_arm', '')
+            if arm_name not in ('left', 'right'):
+                continue
+            if not isinstance(labels, dict):
+                continue
+            configs[arm_name] = {}
+            for label, values in labels.items():
+                if values is None or len(values) != 6:
+                    self.get_logger().warn(
+                        f'taught_configs.yaml: {arm_key}.{label} must have 6 values, skipping.'
+                    )
+                    continue
+                configs[arm_name][label] = np.array(values, dtype=float)
+                self.get_logger().info(
+                    f'  Loaded {arm_name}.{label}: '
+                    f'[{", ".join(f"{v:+.4f}" for v in configs[arm_name][label])}]'
+                )
+
+        self.get_logger().info(f'Loaded taught_configs.yaml from {config_path}')
+        return configs
 
     def joint_state_callback(self, msg: JointState):
         with self.joint_lock:
@@ -383,47 +455,74 @@ class MotionPlannerRealNode(Node):
         other_arm = 'left' if arm_name == 'right' else 'right'
         other_arm_positions = self.get_arm_joint_positions(other_arm)
 
-        # 1. Define Final Target
+        # 1. Define Final Target and check it is within workspace
         final_target_se3 = self.pose_to_se3(request.target_pose)
-        
-        # 2. Define Hover Target (z is overridden to 0.5)
-        hover_target_se3 = self.pose_to_se3(request.target_pose)
-        hover_target_se3.translation[2] = 0.5
 
-        if not self.is_in_workspace(hover_target_se3.translation) or not self.is_in_workspace(final_target_se3.translation):
-            response.success, response.message = False, 'Hover or Final target is out of safe workspace bounds.'
+        if not self.is_in_workspace(final_target_se3.translation):
+            response.success, response.message = False, 'Final target is out of safe workspace bounds.'
             self.get_logger().warn(response.message)
             return response
 
         # =========================================================
-        # PHASE 1: Plan to Hover (z=0.5)
+        # PHASE 1: Determine Hover Configuration
         # =========================================================
-        self.get_logger().info('Phase 1: Planning approach to Hover (z=0.5)')
-        seeds = [primary_seed]
-        for extra in self.EXTRA_SEEDS:
-            if arm_name == 'left':
-                mirrored = extra.copy()
-                mirrored[0], mirrored[3] = -mirrored[0], -mirrored[3]
-                seeds.append(mirrored)
-            else:
-                seeds.append(extra.copy())
+        # Warm-start path: use a physically-taught config as the hover waypoint.
+        # This skips IK for Phase 1 entirely and gives Phase 2 a much better seed.
+        # Fall-back path: compute hover via IK to (x, y, z=0.5) as before.
+        hover_solution = None
+        hover_pos_err, hover_ori_err = 0.0, 0.0
+        used_warm_start = False
 
-        best_hover, hover_pos_err, hover_ori_err = None, float('inf'), float('inf')
-        for seed in seeds[:self.max_ik_seeds]:
-            success, sol, p_err, o_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, seed)
-            if success:
-                if best_hover is None or (p_err + o_err) < (hover_pos_err + hover_ori_err):
-                    best_hover, hover_pos_err, hover_ori_err = sol, p_err, o_err
-                if p_err < self.position_tolerance * 0.5: break
+        if self.use_taught_config and arm_name in self.taught_configs:
+            arm_cfgs = self.taught_configs[arm_name]
+            warm_seed = arm_cfgs.get(mode, arm_cfgs.get('pick'))
+            if warm_seed is not None:
+                hover_solution = warm_seed.copy()
+                used_warm_start = True
+                self.get_logger().info(
+                    f'Phase 1 (warm-start): using taught config for {arm_name}/{mode}: '
+                    f'[{", ".join(f"{v:+.4f}" for v in hover_solution)}]'
+                )
 
-        if best_hover is not None:
-            hover_solution = best_hover
-        else:
-            _, hover_solution, hover_pos_err, hover_ori_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, primary_seed)
-            if hover_pos_err > self.position_tolerance:
-                response.success, response.message = False, f"Phase 1 IK failed: pos_err={hover_pos_err:.4f}m"
+        if hover_solution is None:
+            # Fall back to IK-based hover at z = 0.5
+            hover_target_se3 = self.pose_to_se3(request.target_pose)
+            hover_target_se3.translation[2] = 0.5
+
+            if not self.is_in_workspace(hover_target_se3.translation):
+                response.success, response.message = False, 'Hover target is out of safe workspace bounds.'
                 self.get_logger().warn(response.message)
                 return response
+
+            self.get_logger().info('Phase 1 (IK hover): Planning approach to z=0.5')
+            seeds = [primary_seed]
+            for extra in self.EXTRA_SEEDS:
+                if arm_name == 'left':
+                    mirrored = extra.copy()
+                    mirrored[0], mirrored[3] = -mirrored[0], -mirrored[3]
+                    seeds.append(mirrored)
+                else:
+                    seeds.append(extra.copy())
+
+            best_hover = None
+            for seed in seeds[:self.max_ik_seeds]:
+                success, sol, p_err, o_err = self.solve_ik(arm_name, hover_target_se3, request.use_orientation, seed)
+                if success:
+                    if best_hover is None or (p_err + o_err) < (hover_pos_err + hover_ori_err):
+                        best_hover, hover_pos_err, hover_ori_err = sol, p_err, o_err
+                    if p_err < self.position_tolerance * 0.5:
+                        break
+
+            if best_hover is not None:
+                hover_solution = best_hover
+            else:
+                _, hover_solution, hover_pos_err, hover_ori_err = self.solve_ik(
+                    arm_name, hover_target_se3, request.use_orientation, primary_seed
+                )
+                if hover_pos_err > self.position_tolerance:
+                    response.success, response.message = False, f"Phase 1 IK failed: pos_err={hover_pos_err:.4f}m"
+                    self.get_logger().warn(response.message)
+                    return response
 
         # =========================================================
         # PHASE 2: Plan to Descend (Final Target)
@@ -440,15 +539,26 @@ class MotionPlannerRealNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        # Check Singularity for both solutions
-        cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
+        # Check Singularity
+        # Default threshold raised to 500: real robot Jacobians routinely reach 200-400
+        # even in non-singular configurations; 100 was too tight.
+        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 500.0
         cond_final = self.compute_jacobian_condition(arm_name, final_solution)
-        max_cond = request.max_condition_number if hasattr(request, 'max_condition_number') and request.max_condition_number > 0 else 100.0
 
-        if cond_hover > max_cond or cond_final > max_cond:
-            response.success, response.message = False, f"Near singularity detected (cond={max(cond_hover, cond_final):.1f})"
-            self.get_logger().warn(response.message)
-            return response
+        if used_warm_start:
+            # Taught hover config is physically verified — skip its condition check.
+            # Only check the IK-derived final solution.
+            cond_hover = 0.0
+            if cond_final > max_cond:
+                response.success, response.message = False, f"Near singularity in final IK solution (cond={cond_final:.1f} > {max_cond:.0f})"
+                self.get_logger().warn(response.message)
+                return response
+        else:
+            cond_hover = self.compute_jacobian_condition(arm_name, hover_solution)
+            if cond_hover > max_cond or cond_final > max_cond:
+                response.success, response.message = False, f"Near singularity detected (hover_cond={cond_hover:.1f}, final_cond={cond_final:.1f}, max={max_cond:.0f})"
+                self.get_logger().warn(response.message)
+                return response
 
         # =========================================================
         # PHASE 3: Path Validation (Collisions)

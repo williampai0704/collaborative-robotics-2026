@@ -234,7 +234,7 @@ class GripperController:
             if 'finger' in name and i < len(msg.position):
                 self.finger_positions[name] = msg.position[i]
 
-    def check_grasp(self, side: str, threshold: float = 0.003) -> bool:
+    def check_grasp(self, side: str, threshold: float = 0.002) -> bool:
         """
         Check if the gripper successfully grasped an object.
 
@@ -292,7 +292,7 @@ class GripperController:
         return grasped
 
     def close_and_check(self, side: str, duration: float = 5.0,
-                        threshold: float = 0.003) -> bool:
+                        threshold: float = 0.002) -> bool:
         """
         Close the gripper and check if an object was grasped.
 

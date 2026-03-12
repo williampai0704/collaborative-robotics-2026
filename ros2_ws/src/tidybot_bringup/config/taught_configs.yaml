@@ -1,0 +1,21 @@
+# Taught joint configurations for warm-start IK
+#
+# These are loaded by motion_planner_real_node at startup and used as the
+# starting joint configuration before descending to the final grasp/place target.
+#
+# RECORD YOUR OWN:
+#   ros2 run tidybot_bringup record_joint_config.py --ros-args -p arm_name:=left
+#
+# Joint order: [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+# Units: radians
+#
+# CURRENT VALUES: placeholder (DEFAULT_SEED from motion planner).
+# Replace with physically recorded values by running record_joint_config.py.
+
+left_arm:
+  pick:  [-0.0598, +0.4955, +0.4617, +3.0450, -0.7517, +0.2102]
+  place: [-0.0598, +0.4955, +0.4617, +3.0450, -0.7517, +0.2102]
+
+right_arm:
+  pick:  [-0.0598, -0.4955, 0.4617, -3.0450, 0.7517, -0.2102]
+  place: [-0.0598, -0.4955, 0.4617, -3.0450, 0.7517, -0.2102]

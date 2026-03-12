@@ -37,6 +37,7 @@ install(PROGRAMS
   scripts/test_full_robot.py
   scripts/test_tf.py
   scripts/test_planner_real.py
+  scripts/record_joint_config.py
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
@@ -48,6 +49,8 @@ install(PROGRAMS
   scripts/task_1.py
   scripts/task_2.py
   scripts/task_3.py
+  scripts/task_4.py
+  scripts/task_5.py
   # Vision scripts
   scripts/vision/find_center.py
   scripts/vision/color_mask.py
