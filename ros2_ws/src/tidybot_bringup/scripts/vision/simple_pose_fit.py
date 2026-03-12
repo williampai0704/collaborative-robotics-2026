@@ -34,7 +34,7 @@ Parameters:
 - debug: Enable debug mode with step-by-step 3D visualization
 - debug_dataset: Dataset folder name (e.g., 'yellow_block_1')
 - debug_frame: Frame index within the dataset
-- target_color: Color to detect (red, green, blue, yellow)
+- target_color: Color to detect (red, green, blue, yellow, orange, purple)
 - visualize: Enable live 2D OpenCV visualization
 - top_surface_threshold: Height threshold for top surface extraction (meters)
 - table_distance_threshold: RANSAC distance threshold for table plane (meters)

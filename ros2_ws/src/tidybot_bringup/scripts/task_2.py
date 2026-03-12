@@ -25,7 +25,7 @@ For Speech:
     ros2 run tidybot_bringup task_2.py \
         --ros-args -p use_speech:=true
 
-Available colors:  red, green, blue, yellow
+Available colors:  red, green, blue, yellow, orange, purple
 Available arms:    left, right
 
 ─── What this script does automatically ───────────────────────────────────────
@@ -82,6 +82,7 @@ import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from std_msgs.msg import Float32, String
+from tidybot_msgs.msg import GripperCommand
 
 from scipy.spatial.transform import Rotation as ScipyRotation
 
@@ -101,17 +102,25 @@ RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
 
 APPROACH_DIST     = 0.35  # m   — stop driving when block is this close
 BIN_APPROACH_DIST = 0.35  # m   — stop driving when bin is this close (closer for place)
-APPROACH_SPEED  = 0.04  # m/s — forward speed during approach
-SPIN_SPEED      = 0.2   # rad/s
+APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
+SPIN_SPEED      = 0.25   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
 
-POSE_WAIT_TIMEOUT  = 8.0   # s — additional wait after settle for pose samples
+POSE_WAIT_TIMEOUT  = 15.0   # s — additional wait after settle for pose samples
 SETTLE_TIME        = 2.0   # s — wait for robot to stop moving before accepting poses
 NUM_POSE_SAMPLES   = 10    # number of pose samples to average for robust estimate
 RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target result (includes execution)
 MAX_GRASP_RETRIES  = 3
 GRASP_Z            = 0.07  # fixed grasp/place height in base_link frame (m)
+MOTION_DURATION    = 3.0   # s — time for each arm motion segment (hover→target, etc.)
+
+# Calibration offsets applied to every IK target (metres, base_link frame).
+# Tune these to correct systematic camera / hardware errors.
+#   X = forward/back   Y = left/right   Z = up/down
+GRASP_OFFSET_X     = 0.03
+GRASP_OFFSET_Y     = -0.045
+GRASP_OFFSET_Z     = 0.0
 
 # =============================================================================
 # States
@@ -159,6 +168,8 @@ class Task2Node(Node):
         # ── Publishers ──────────────────────────────────────────────────────
         self.cmd_vel_pub  = self.create_publisher(Twist,  '/cmd_vel',             10)
         self.color_pub    = self.create_publisher(String, '/vision/target_color', 10)
+        self.left_gripper_pub  = self.create_publisher(GripperCommand, '/left_gripper/command',  10)
+        self.right_gripper_pub = self.create_publisher(GripperCommand, '/right_gripper/command', 10)
 
         # ── Service client ───────────────────────────────────────────────────
         self.plan_client = self.create_client(
@@ -266,6 +277,17 @@ class Task2Node(Node):
         t.angular.z = float(np.clip(-h_err * ANGULAR_GAIN, -0.5, 0.5))
         self.cmd_vel_pub.publish(t)
 
+    def _open_gripper(self):
+        """Publish an open-gripper command for the active arm."""
+        cmd = GripperCommand()
+        cmd.position = 0.0
+        cmd.effort = 0.5
+        if self.arm_name == 'left':
+            self.left_gripper_pub.publish(cmd)
+        else:
+            self.right_gripper_pub.publish(cmd)
+        self.get_logger().info(f'[Gripper] Opened {self.arm_name} gripper')
+
     def _start_vision_nodes(self, color: str):
         """Stop any running vision nodes and relaunch with new target color."""
         self._stop_vision_nodes()
@@ -341,7 +363,7 @@ class Task2Node(Node):
         """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_color_optical_frame',
+                'base_link', 'camera_depth_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=1.0))
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
@@ -361,8 +383,8 @@ class Task2Node(Node):
         out = PoseStamped()
         out.header.stamp    = self.get_clock().now().to_msg()
         out.header.frame_id = 'base_link'
-        out.pose.position.x = float(R[0, 3]) - 0.015
-        out.pose.position.y = float(R[1, 3]) - 0.025
+        out.pose.position.x = float(R[0, 3])
+        out.pose.position.y = float(R[1, 3])
         out.pose.position.z = float(R[2, 3])
         qb = ScipyRotation.from_matrix(R[:3, :3]).as_quat()
         out.pose.orientation.x = float(qb[0])
@@ -373,7 +395,7 @@ class Task2Node(Node):
 
     def _call_plan_to_target(self, pose_base: PoseStamped,
                               mode: str = 'pick',
-                              duration: float = 5.0) -> bool:
+                              duration: float = MOTION_DURATION) -> bool:
         """
         Build and send an async /plan_to_target request.
         Returns True if the request was sent, False if the service isn't ready.
@@ -388,7 +410,9 @@ class Task2Node(Node):
         req.arm_name                = self.arm_name
         req.mode                    = mode
         req.target_pose             = pose_base.pose
-        req.target_pose.position.z  = GRASP_Z
+        req.target_pose.position.x += GRASP_OFFSET_X
+        req.target_pose.position.y += GRASP_OFFSET_Y
+        req.target_pose.position.z  = GRASP_Z + GRASP_OFFSET_Z
         req.use_orientation         = False
         req.max_condition_number    = 500.0
         req.execute                 = True
@@ -535,7 +559,7 @@ class Task2Node(Node):
                 self._transition(State.ERROR)
                 return
 
-            sent = self._call_plan_to_target(pose_base, mode=mode, duration=5.0)
+            sent = self._call_plan_to_target(pose_base, mode=mode, duration=MOTION_DURATION)
             if not sent:
                 return  # retry next tick
 
@@ -583,6 +607,8 @@ class Task2Node(Node):
                     if retries < max_retries:
                         self.get_logger().warn(
                             f'Retrying ({retries}/{max_retries}) …')
+                        if mode == 'pick':
+                            self._open_gripper()
                         self.pose_timestamp = None
                         self._transition(retry_state)
                         return

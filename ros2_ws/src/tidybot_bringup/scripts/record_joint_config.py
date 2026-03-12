@@ -107,9 +107,12 @@ class Recorder(Node):
         req.name = f'{self.arm_name}_arm'
         req.enable = enable
         future = self._torque_client.call_async(req)
+        # The background rclpy.spin() thread handles the response — just wait.
+        # Do NOT call rclpy.spin_once() here; that would fight the background thread
+        # and corrupt the executor, causing joint state callbacks to stop firing.
         deadline = time.time() + 5.0
         while not future.done() and time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
         label = 'ENABLED' if enable else 'DISABLED'
         print(f'  Torque {label} on /{self._ns}')
 
@@ -117,24 +120,45 @@ class Recorder(Node):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_config(config_path: Path, arm_name: str, label: str, pos: np.ndarray):
-    """Read → update → write the YAML config file atomically."""
+    """Read → update → write the YAML config file.
+
+    Normalises keys so both 'left' and 'left_arm' in the existing file are
+    treated as the same arm, and always written back as plain 'left'/'right'.
+    """
     data: dict = {}
     if config_path.exists():
         with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        # Normalise any 'left_arm'/'right_arm' keys to plain 'left'/'right'
+        for k, v in raw.items():
+            norm = k.replace('_arm', '')
+            data[norm] = v
+    else:
+        print(f'  NOTE: {config_path} not found — will create it.')
 
     if arm_name not in data:
         data[arm_name] = {}
 
     data[arm_name][label] = [round(float(v), 6) for v in pos]
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, 'w') as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-
-    print(f'  Saved  →  {arm_name}.{label}')
-    print(f'           [{", ".join(f"{v:+.6f}" for v in pos)}]')
-    print(f'  File   →  {config_path}')
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        print(f'  Saved  →  {arm_name}.{label}')
+        print(f'           [{", ".join(f"{v:+.6f}" for v in pos)}]')
+        print(f'  File   →  {config_path}')
+    except Exception as e:
+        print(f'  ERROR saving to {config_path}: {e}')
+        # Try writing next to this script as a fallback
+        fallback = Path(__file__).resolve().parents[1] / 'config' / 'taught_configs.yaml'
+        try:
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            with open(fallback, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            print(f'  Saved to fallback: {fallback}')
+        except Exception as e2:
+            print(f'  Fallback also failed: {e2}')
 
 
 def print_positions(pos: 'np.ndarray | None'):
