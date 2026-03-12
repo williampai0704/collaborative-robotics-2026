@@ -122,7 +122,7 @@ MOTION_DURATION    = 3.0   # s — time for each arm motion segment (hover→tar
 # Tune these to correct systematic camera / hardware errors.
 #   X = forward/back   Y = left/right   Z = up/down (adds to GRASP_Z)
 GRASP_OFFSET_X     = 0.01
-GRASP_OFFSET_Y     = -0.045
+GRASP_OFFSET_Y     = -0.035
 GRASP_OFFSET_Z     = 0.0
 
 SPEECH_TIMEOUT     = 60.0  # s — give up waiting for voice command after this
