@@ -82,6 +82,7 @@ import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from std_msgs.msg import Float32, String
+from tidybot_msgs.msg import GripperCommand
 
 from scipy.spatial.transform import Rotation as ScipyRotation
 
@@ -102,13 +103,13 @@ RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
 APPROACH_DIST     = 0.35  # m   — stop driving when block is this close
 BIN_APPROACH_DIST = 0.35  # m   — stop driving when bin is this close (closer for place)
 APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
-SPIN_SPEED      = 0.3   # rad/s
+SPIN_SPEED      = 0.25   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
 
-POSE_WAIT_TIMEOUT  = 4.0   # s — additional wait after settle for pose samples
-SETTLE_TIME        = 1.0   # s — wait for robot to stop moving before accepting poses
-NUM_POSE_SAMPLES   = 5    # number of pose samples to average for robust estimate
+POSE_WAIT_TIMEOUT  = 15.0   # s — additional wait after settle for pose samples
+SETTLE_TIME        = 2.0   # s — wait for robot to stop moving before accepting poses
+NUM_POSE_SAMPLES   = 10    # number of pose samples to average for robust estimate
 RESULT_TIMEOUT     = 30.0  # s — max wait for /plan_to_target result (includes execution)
 MAX_GRASP_RETRIES  = 3
 GRASP_Z            = 0.07  # fixed grasp/place height in base_link frame (m)
@@ -117,8 +118,8 @@ MOTION_DURATION    = 3.0   # s — time for each arm motion segment (hover→tar
 # Calibration offsets applied to every IK target (metres, base_link frame).
 # Tune these to correct systematic camera / hardware errors.
 #   X = forward/back   Y = left/right   Z = up/down
-GRASP_OFFSET_X     = 0.0
-GRASP_OFFSET_Y     = 0.0
+GRASP_OFFSET_X     = 0.03
+GRASP_OFFSET_Y     = -0.045
 GRASP_OFFSET_Z     = 0.0
 
 # =============================================================================
@@ -167,6 +168,8 @@ class Task2Node(Node):
         # ── Publishers ──────────────────────────────────────────────────────
         self.cmd_vel_pub  = self.create_publisher(Twist,  '/cmd_vel',             10)
         self.color_pub    = self.create_publisher(String, '/vision/target_color', 10)
+        self.left_gripper_pub  = self.create_publisher(GripperCommand, '/left_gripper/command',  10)
+        self.right_gripper_pub = self.create_publisher(GripperCommand, '/right_gripper/command', 10)
 
         # ── Service client ───────────────────────────────────────────────────
         self.plan_client = self.create_client(
@@ -274,6 +277,17 @@ class Task2Node(Node):
         t.angular.z = float(np.clip(-h_err * ANGULAR_GAIN, -0.5, 0.5))
         self.cmd_vel_pub.publish(t)
 
+    def _open_gripper(self):
+        """Publish an open-gripper command for the active arm."""
+        cmd = GripperCommand()
+        cmd.position = 0.0
+        cmd.effort = 0.5
+        if self.arm_name == 'left':
+            self.left_gripper_pub.publish(cmd)
+        else:
+            self.right_gripper_pub.publish(cmd)
+        self.get_logger().info(f'[Gripper] Opened {self.arm_name} gripper')
+
     def _start_vision_nodes(self, color: str):
         """Stop any running vision nodes and relaunch with new target color."""
         self._stop_vision_nodes()
@@ -349,7 +363,7 @@ class Task2Node(Node):
         """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_color_optical_frame',
+                'base_link', 'camera_depth_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=1.0))
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
@@ -593,6 +607,8 @@ class Task2Node(Node):
                     if retries < max_retries:
                         self.get_logger().warn(
                             f'Retrying ({retries}/{max_retries}) …')
+                        if mode == 'pick':
+                            self._open_gripper()
                         self.pose_timestamp = None
                         self._transition(retry_state)
                         return
