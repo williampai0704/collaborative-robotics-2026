@@ -135,6 +135,9 @@ class SpeechExtractionNode(Node):
         google_api_key = self.get_parameter('google_api_key').get_parameter_value().string_value
         json_key_path = self.get_parameter('json_key_path').get_parameter_value().string_value
         custom_prompt = self.get_parameter('extraction_prompt').get_parameter_value().string_value
+        if not custom_prompt:
+            import os
+            custom_prompt = os.environ.get('EXTRACTION_PROMPT', '')
         active_prompt = custom_prompt if custom_prompt else self.EXTRACTION_PROMPT
 
         # Try to find credentials in config folder if not provided
