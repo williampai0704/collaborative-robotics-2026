@@ -47,10 +47,9 @@ def color_mask(color_img, color_name='r'):
 
     if color == 'red':
         # Red wraps around 0 and 180
-        # Widened ranges + lower S/V floors for robustness under poor lighting
-        lower1 = np.array([0, 40, 30])
-        upper1 = np.array([12, 255, 255])
-        lower2 = np.array([165, 40, 30])
+        lower1 = np.array([0, 70, 50])
+        upper1 = np.array([10, 255, 255])
+        lower2 = np.array([170, 70, 50])
         upper2 = np.array([180, 255, 255])
         mask = cv2.bitwise_or(
             cv2.inRange(hsv_img, lower1, upper1),
