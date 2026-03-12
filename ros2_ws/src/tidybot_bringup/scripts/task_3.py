@@ -52,8 +52,6 @@ For each block in the specified order:
   APPROACH_BLOCK drive forward with heading correction; stop at APPROACH_DIST
     ↑ (drift > RECENTER_TOL)  → back to FIND_BLOCK
     ↓ (distance ≤ APPROACH_DIST)
-  TILT_BLOCK     adjust camera tilt for vertical centering
-    ↓ (v_err < VERTICAL_TOL)
   WAIT_BLOCK_POSE wait for fresh /object_pose from simple_pose_fit
     ↓
   GRASP          call /plan_to_target (mode=pick); retry up to 3x if grasped=False
@@ -62,8 +60,6 @@ For each block in the specified order:
     ↓
   APPROACH_BIN   same approach logic
     ↑ (drift)    → back to FIND_BIN
-    ↓
-  TILT_BIN       centre bin vertically
     ↓
   WAIT_BIN_POSE  wait for fresh /object_pose
     ↓
@@ -89,7 +85,7 @@ from rclpy.executors import MultiThreadedExecutor
 import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from std_msgs.msg import Float32, String, Float64MultiArray
+from std_msgs.msg import Float32, String
 from tidybot_msgs.msg import GripperCommand
 
 from scipy.spatial.transform import Rotation as ScipyRotation
@@ -107,17 +103,12 @@ CENTER_Y      = IMAGE_HEIGHT / 2.0
 
 HORIZONTAL_TOL  = 50    # px  — stop spinning: |cx − CENTER_X| < this
 RECENTER_TOL    = 120   # px  — stop approach and re-center if drift > this
-VERTICAL_TOL    = 60    # px  — stop tilting: |cy − CENTER_Y| < this
 
 APPROACH_DIST   = 0.35  # m   — stop driving when object is this close
 APPROACH_SPEED  = 0.06  # m/s — forward speed during approach
 SPIN_SPEED      = 0.2   # rad/s
 ANGULAR_GAIN    = 0.003 # rad/s per px of horizontal error (heading correction)
 
-TILT_GAIN       = 0.001 # rad / px
-TILT_MIN        = -0.5  # rad
-TILT_MAX        =  0.3  # rad
-TILT_SWEEP_SPEED = 0.012 # rad per loop tick (20 Hz → ~0.16 rad/s sweep)
 
 POSE_WAIT_TIMEOUT  = 15.0   # s — additional wait after settle for pose samples
 SETTLE_TIME        = 2.0   # s — wait for robot to stop moving before accepting poses
@@ -130,7 +121,7 @@ MOTION_DURATION    = 3.0   # s — time for each arm motion segment (hover→tar
 # Calibration offsets applied to every IK target (metres, base_link frame).
 # Tune these to correct systematic camera / hardware errors.
 #   X = forward/back   Y = left/right   Z = up/down (adds to GRASP_Z)
-GRASP_OFFSET_X     = 0.03
+GRASP_OFFSET_X     = 0.01
 GRASP_OFFSET_Y     = -0.045
 GRASP_OFFSET_Z     = 0.0
 
@@ -158,13 +149,11 @@ class State(Enum):
     # ── Per-block loop ────────────────────────────────────────────────────────
     FIND_BLOCK     = auto()   # spin to centre current block horizontally
     APPROACH_BLOCK = auto()   # drive forward; stop when close enough
-    TILT_BLOCK     = auto()   # centre block vertically in camera
     WAIT_BLOCK_POSE= auto()   # wait for fresh /object_pose
     GRASP          = auto()   # call /plan_to_target (mode=pick)
     # ── Bin ───────────────────────────────────────────────────────────────────
     FIND_BIN       = auto()   # spin to centre bin horizontally
     APPROACH_BIN   = auto()   # drive forward; stop when close enough
-    TILT_BIN       = auto()   # centre bin vertically in camera
     WAIT_BIN_POSE  = auto()   # wait for fresh /object_pose
     PLACE          = auto()   # call /plan_to_target (mode=place)
     # ─────────────────────────────────────────────────────────────────────────
@@ -202,7 +191,6 @@ class Task3Node(Node):
 
         # ── Publishers ──────────────────────────────────────────────────────
         self.cmd_vel_pub  = self.create_publisher(Twist,             '/cmd_vel',             10)
-        self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd', 10)
         self.color_pub    = self.create_publisher(String,            '/vision/target_color', 10)
         self.left_gripper_pub  = self.create_publisher(GripperCommand, '/left_gripper/command',  10)
         self.right_gripper_pub = self.create_publisher(GripperCommand, '/right_gripper/command', 10)
@@ -227,9 +215,6 @@ class Task3Node(Node):
         self.object_pose:     Optional[PoseStamped] = None
         self.pose_timestamp:  Optional[float]       = None
 
-        self._cmd_pan:        float = 0.0
-        self._cmd_tilt:       float = 0.0
-        self._tilt_sweep_dir: float = -1.0  # -1 = sweep down, +1 = sweep up
         self._spin_sign:      float = 1.0  # +1 = positive spin, flips to -1 after grasp
         self._grasp_retries:  int   = 0
 
@@ -348,14 +333,6 @@ class Task3Node(Node):
         t.angular.z = float(np.clip(-h_err * ANGULAR_GAIN, -0.5, 0.5))
         self.cmd_vel_pub.publish(t)
 
-    def _set_pan_tilt(self, pan: float, tilt: float):
-        tilt = 0.0  # Camera tilt disabled
-        self._cmd_pan  = float(pan)
-        self._cmd_tilt = tilt
-        msg = Float64MultiArray()
-        msg.data = [self._cmd_pan, self._cmd_tilt]
-        self.pan_tilt_pub.publish(msg)
-
     def _start_vision_nodes(self, color: str):
         """Stop running vision nodes and relaunch with new target color."""
         self._stop_vision_nodes()
@@ -434,7 +411,6 @@ class Task3Node(Node):
                 f'Block {self._block_idx}/{len(self._block_queue)}: '
                 f'switching to [{next_color}]')
             self._spin_sign = 1.0
-            self._set_pan_tilt(0.0, 0.0)
             self._switch_vision(next_color)
             self._transition(State.FIND_BLOCK)
         else:
@@ -505,7 +481,7 @@ class Task3Node(Node):
     def _do_find(self, next_state: State):
         mc = self.mask_center
         if mc is None:
-            # Target not visible — spin only (no tilt sweep)
+            # Target not visible — spin to search
             self._spin()
             return
         h_err = mc.x - CENTER_X
@@ -518,7 +494,7 @@ class Task3Node(Node):
         else:
             self._spin()
 
-    def _do_approach(self, find_state: State, tilt_state: State):
+    def _do_approach(self, find_state: State, next_state: State):
         mc   = self.mask_center
         dist = self.object_distance
         if mc is None:
@@ -538,31 +514,9 @@ class Task3Node(Node):
                 throttle_duration_sec=0.5)
             if dist <= APPROACH_DIST:
                 self._stop()
-                self._transition(tilt_state)
+                self._transition(next_state)
                 return
         self._drive(h_err)
-
-    def _do_tilt(self, find_state: State, next_state: State):
-        mc = self.mask_center
-        if mc is None:
-            self.get_logger().warn('Object lost during tilt – re-searching')
-            self._transition(find_state)
-            return
-        h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y
-        self.get_logger().info(
-            f'[{self.state.name}] h_err={h_err:+.0f}  v_err={v_err:+.0f}  '
-            f'tilt={self._cmd_tilt:.3f} rad',
-            throttle_duration_sec=0.3)
-        if abs(h_err) > RECENTER_TOL:
-            self.get_logger().warn(f'Horizontal drift ({h_err:+.0f} px) – re-searching')
-            self._transition(find_state)
-            return
-        if abs(v_err) < VERTICAL_TOL:
-            self.pose_timestamp = None
-            self._transition(next_state)
-        else:
-            self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
 
     def _do_wait_pose(self, next_state: State):
         """Wait for robot to settle, then collect and average pose samples.
@@ -719,12 +673,7 @@ class Task3Node(Node):
         # ── APPROACH_BLOCK ────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BLOCK:
             self._do_approach(find_state=State.FIND_BLOCK,
-                              tilt_state=State.WAIT_BLOCK_POSE)
-
-        # ── TILT_BLOCK ────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BLOCK:
-            self._do_tilt(find_state=State.FIND_BLOCK,
-                          next_state=State.WAIT_BLOCK_POSE)
+                              next_state=State.WAIT_BLOCK_POSE)
 
         # ── WAIT_BLOCK_POSE ───────────────────────────────────────────────────
         elif self.state == State.WAIT_BLOCK_POSE:
@@ -744,7 +693,6 @@ class Task3Node(Node):
             if self.state == State.FIND_BIN:
                 self._grasp_retries = 0
                 self._spin_sign = -1.0
-                self._set_pan_tilt(0.0, 0.0)
                 self._switch_vision(self.bin_color)
 
         # ── FIND_BIN ──────────────────────────────────────────────────────────
@@ -757,12 +705,7 @@ class Task3Node(Node):
         # ── APPROACH_BIN ──────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BIN:
             self._do_approach(find_state=State.FIND_BIN,
-                              tilt_state=State.WAIT_BIN_POSE)
-
-        # ── TILT_BIN ──────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BIN:
-            self._do_tilt(find_state=State.FIND_BIN,
-                          next_state=State.WAIT_BIN_POSE)
+                              next_state=State.WAIT_BIN_POSE)
 
         # ── WAIT_BIN_POSE ─────────────────────────────────────────────────────
         elif self.state == State.WAIT_BIN_POSE:
