@@ -16,7 +16,8 @@ Usage:
     ros2 run tidybot_bringup find_center.py --ros-args -p visualize:=true
 
     # Debug mode (from test_data)
-    ros2 run tidybot_bringup find_center.py --ros-args -p debug:=true -p debug_pair:=0
+    ros2 run tidybot_bringup find_center.py --ros-args -p debug:=true
+    ros2 run tidybot_bringup find_center.py --ros-args -p debug:=true -p debug_dataset:=yellow_block_1 -p debug_frame:=0
 
     # Change target color (r, g, b, y)
     ros2 run tidybot_bringup find_center.py --ros-args -p target_color:=yellow
@@ -49,14 +50,16 @@ class FindCenter(Node):
 
         # Declare parameters
         self.declare_parameter('debug', False)
-        self.declare_parameter('debug_pair', 0)
-        self.declare_parameter('target_color', 'red')  # Use full name to avoid YAML 'y'=true issue
+        self.declare_parameter('debug_dataset', 'yellow_block_1')  # Dataset folder name
+        self.declare_parameter('debug_frame', 0)  # Frame index within dataset
+        self.declare_parameter('target_color', 'yellow')  # Use full name to avoid YAML 'y'=true issue
         self.declare_parameter('use_sam3_mask', False)  # Set True to use SAM3 mask instead
         self.declare_parameter('visualize', False)  # Enable live visualization
 
         # Get parameters
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
-        self.debug_pair = self.get_parameter('debug_pair').get_parameter_value().integer_value
+        self.debug_dataset = self.get_parameter('debug_dataset').get_parameter_value().string_value
+        self.debug_frame = self.get_parameter('debug_frame').get_parameter_value().integer_value
         self.target_color = self.get_parameter('target_color').get_parameter_value().string_value
         self.use_sam3_mask = self.get_parameter('use_sam3_mask').get_parameter_value().bool_value
         self.visualize = self.get_parameter('visualize').get_parameter_value().bool_value
@@ -71,7 +74,7 @@ class FindCenter(Node):
 
         if self.debug:
             # Debug mode: load from test_data
-            self.get_logger().info(f'DEBUG MODE: Loading from test_data/pair_{self.debug_pair:04d}')
+            self.get_logger().info(f'DEBUG MODE: Loading from test_data/{self.debug_dataset}/rgb/rgb_{self.debug_frame:04d}.png')
             self.get_logger().info(f'Target color: {self.target_color}')
             # Timer to process once after startup
             self.timer = self.create_timer(1.0, self.debug_process)
@@ -96,15 +99,24 @@ class FindCenter(Node):
         """Process test data in debug mode with visualization."""
         self.timer.cancel()  # Only run once
 
-        pair_dir = os.path.join(TEST_DATA_PATH, f'pair_{self.debug_pair:04d}')
-        rgb_path = os.path.join(pair_dir, 'rgb.png')
+        dataset_dir = os.path.join(TEST_DATA_PATH, self.debug_dataset)
+        rgb_path = os.path.join(dataset_dir, 'rgb', f'rgb_{self.debug_frame:04d}.png')
 
         if not os.path.exists(rgb_path):
             self.get_logger().error(f'RGB image not found: {rgb_path}')
+            # List available datasets
+            if os.path.exists(TEST_DATA_PATH):
+                datasets = [d for d in os.listdir(TEST_DATA_PATH) 
+                           if os.path.isdir(os.path.join(TEST_DATA_PATH, d))]
+                self.get_logger().info(f'Available datasets: {datasets}')
             return
 
         # Load RGB image
         rgb = cv2.imread(rgb_path)
+        if rgb is None:
+            self.get_logger().error(f'Failed to load RGB image: {rgb_path}')
+            return
+            
         rgb_display = rgb.copy()  # Keep BGR for display
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         self.get_logger().info(f'Loaded RGB image: {rgb.shape}')
