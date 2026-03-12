@@ -349,7 +349,7 @@ class Task3Node(Node):
         self.cmd_vel_pub.publish(t)
 
     def _set_pan_tilt(self, pan: float, tilt: float):
-        tilt = float(np.clip(tilt, TILT_MIN, TILT_MAX))
+        tilt = 0.0  # Camera tilt disabled
         self._cmd_pan  = float(pan)
         self._cmd_tilt = tilt
         msg = Float64MultiArray()
