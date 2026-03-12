@@ -32,32 +32,38 @@ Gemini extracts ordered (block:bin) pairs returned in object_color as
   "red:green,blue:yellow,orange:purple"
 (colon separates block from bin; comma separates pairs).
 
+─── Available colors ──────────────────────────────────────────────────────────
+  red, green, blue, yellow, orange, purple
+
+─── Example speech commands ───────────────────────────────────────────────────
+  "Put the red block in the green bin and the blue block in the yellow bin."
+  "Orange in purple, then red in green."
+  "Place the purple block in the blue bin, the yellow block in the red bin,
+   and the orange block in the green bin."
+
 ─── State machine ─────────────────────────────────────────────────────────────
   WAIT_SPEECH  listen; valid pairs → FIND_BLOCK; timeout (no pairs received) → ERROR
     ↓
   [for each (block_color, bin_color) pair in queue:]
-  FIND_BLOCK   spin to centre block
+  FIND_BLOCK   spin to centre block horizontally
     ↓
-  APPROACH_BLOCK
+  APPROACH_BLOCK drive forward; stop at APPROACH_DIST
     ↓
-  TILT_BLOCK
-    ↓
-  WAIT_BLOCK_POSE
+  WAIT_BLOCK_POSE  wait for averaged /object_pose
     ↓
   GRASP        pick block; switch vision to this pair's bin_color → FIND_BIN
     ↓
-  FIND_BIN
+  FIND_BIN     spin to centre bin horizontally
     ↓
-  APPROACH_BIN
+  APPROACH_BIN drive forward; stop at APPROACH_DIST
     ↓
-  TILT_BIN
-    ↓
-  WAIT_BIN_POSE
+  WAIT_BIN_POSE  wait for averaged /object_pose
     ↓
   PLACE        place block → advance to next pair → FIND_BLOCK (or DONE)
   DONE / ERROR
 """
 
+import os
 import time
 import subprocess
 from enum import Enum, auto
@@ -75,6 +81,7 @@ import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from std_msgs.msg import Float32, String, Float64MultiArray
+from tidybot_msgs.msg import GripperCommand
 
 from scipy.spatial.transform import Rotation as ScipyRotation
 
@@ -89,30 +96,25 @@ IMAGE_HEIGHT  = 480
 CENTER_X      = IMAGE_WIDTH  / 2.0
 CENTER_Y      = IMAGE_HEIGHT / 2.0
 
-HORIZONTAL_TOL   = 50    # px
-RECENTER_TOL     = 120   # px
-VERTICAL_TOL     = 60    # px
+HORIZONTAL_TOL   = 50    # px — stop spinning: |cx − CENTER_X| < this
+RECENTER_TOL     = 120   # px — stop approach and re-center if drift > this
 
-APPROACH_DIST    = 0.50  # m
-APPROACH_SPEED   = 0.06  # m/s
-SPIN_SPEED       = 0.3   # rad/s
-ANGULAR_GAIN     = 0.003
+APPROACH_DIST    = 0.35  # m   — stop driving when object is this close
+APPROACH_SPEED   = 0.06  # m/s — forward speed during approach
+SPIN_SPEED       = 0.2   # rad/s
+ANGULAR_GAIN     = 0.003 # rad/s per px of horizontal error
 
-TILT_GAIN        = 0.001
-TILT_MIN         = -0.5  # rad
-TILT_MAX         =  0.3  # rad
-TILT_SWEEP_SPEED = 0.012
-
-POSE_WAIT_TIMEOUT = 4.0   # s
-SETTLE_TIME       = 1.0   # s
-NUM_POSE_SAMPLES  = 5
-RESULT_TIMEOUT    = 30.0  # s
+POSE_WAIT_TIMEOUT = 8.0   # s — additional wait after settle for pose samples
+SETTLE_TIME       = 2.0   # s — wait for robot to stop moving before accepting poses
+NUM_POSE_SAMPLES  = 10    # number of pose samples to average for robust estimate
+RESULT_TIMEOUT    = 30.0  # s — max wait for /plan_to_target (includes execution)
 MAX_GRASP_RETRIES = 3
-GRASP_Z           = 0.07  # m
-MOTION_DURATION   = 3.0   # s
+GRASP_Z           = 0.07  # m — fixed grasp/place height in base_link frame
+MOTION_DURATION   = 3.0   # s — time for each arm motion segment
 
-GRASP_OFFSET_X    = 0.0
-GRASP_OFFSET_Y    = 0.0
+# Calibration offsets applied to every IK target (metres, base_link frame).
+GRASP_OFFSET_X    = 0.03
+GRASP_OFFSET_Y    = -0.045
 GRASP_OFFSET_Z    = 0.0
 
 SPEECH_TIMEOUT    = 60.0  # s
@@ -143,12 +145,10 @@ class State(Enum):
     WAIT_SPEECH    = auto()
     FIND_BLOCK     = auto()
     APPROACH_BLOCK = auto()
-    TILT_BLOCK     = auto()
     WAIT_BLOCK_POSE= auto()
     GRASP          = auto()
     FIND_BIN       = auto()
     APPROACH_BIN   = auto()
-    TILT_BIN       = auto()
     WAIT_BIN_POSE  = auto()
     PLACE          = auto()
     DONE           = auto()
@@ -189,9 +189,11 @@ class Task5Node(Node):
         self.client_cb_group = MutuallyExclusiveCallbackGroup()
 
         # ── Publishers ──────────────────────────────────────────────────────
-        self.cmd_vel_pub  = self.create_publisher(Twist,             '/cmd_vel',             10)
-        self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd', 10)
-        self.color_pub    = self.create_publisher(String,            '/vision/target_color', 10)
+        self.cmd_vel_pub       = self.create_publisher(Twist,             '/cmd_vel',                  10)
+        self.pan_tilt_pub      = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd',      10)
+        self.color_pub         = self.create_publisher(String,            '/vision/target_color',      10)
+        self.left_gripper_pub  = self.create_publisher(GripperCommand,    '/left_gripper/command',     10)
+        self.right_gripper_pub = self.create_publisher(GripperCommand,    '/right_gripper/command',    10)
 
         # ── Service client ───────────────────────────────────────────────────
         self.plan_client = self.create_client(
@@ -214,8 +216,7 @@ class Task5Node(Node):
         self.pose_timestamp:  Optional[float]       = None
 
         self._cmd_pan:        float = 0.0
-        self._cmd_tilt:       float = 0.0
-        self._tilt_sweep_dir: float = -1.0
+        self._spin_sign:      float = 1.0   # flips to -1.0 after grasp to search opposite
         self._grasp_retries:  int   = 0
 
         self._pending_future = None
@@ -232,10 +233,11 @@ class Task5Node(Node):
         # ── Initial state ────────────────────────────────────────────────────
         if self.use_speech:
             self.state = State.WAIT_SPEECH
+            env = os.environ.copy()
+            env['EXTRACTION_PROMPT'] = TASK5_EXTRACTION_PROMPT
             self._speech_proc = subprocess.Popen([
                 'ros2', 'run', 'tidybot_bringup', 'speech_extraction_node.py',
-                '--ros-args', '-p', f'extraction_prompt:={TASK5_EXTRACTION_PROMPT}',
-            ])
+            ], env=env)
         else:
             self.state = State.FIND_BLOCK
             self._start_vision_nodes(self._current_block_color)
@@ -290,6 +292,7 @@ class Task5Node(Node):
             self._speech_proc.terminate()
             self._speech_proc = None
 
+        self._spin_sign = 1.0
         self._switch_vision(self._current_block_color)
         self._transition(State.FIND_BLOCK)
 
@@ -329,8 +332,19 @@ class Task5Node(Node):
 
     def _spin(self):
         t = Twist()
-        t.angular.z = SPIN_SPEED
+        t.angular.z = self._spin_sign * SPIN_SPEED
         self.cmd_vel_pub.publish(t)
+
+    def _open_gripper(self):
+        """Publish an open-gripper command for the active arm."""
+        cmd = GripperCommand()
+        cmd.position = 0.0
+        cmd.effort   = 0.5
+        if self.arm_name == 'left':
+            self.left_gripper_pub.publish(cmd)
+        else:
+            self.right_gripper_pub.publish(cmd)
+        self.get_logger().info(f'[Gripper] Opened {self.arm_name} gripper')
 
     def _drive(self, h_err: float):
         t = Twist()
@@ -339,11 +353,9 @@ class Task5Node(Node):
         self.cmd_vel_pub.publish(t)
 
     def _set_pan_tilt(self, pan: float, tilt: float):
-        tilt = float(np.clip(tilt, TILT_MIN, TILT_MAX))
-        self._cmd_pan  = float(pan)
-        self._cmd_tilt = tilt
+        self._cmd_pan = float(pan)
         msg = Float64MultiArray()
-        msg.data = [self._cmd_pan, self._cmd_tilt]
+        msg.data = [self._cmd_pan, float(tilt)]
         self.pan_tilt_pub.publish(msg)
 
     def _start_vision_nodes(self, color: str):
@@ -378,6 +390,7 @@ class Task5Node(Node):
         """Move to next (block, bin) pair or finish if queue exhausted."""
         self._block_idx    += 1
         self._grasp_retries = 0
+        self._spin_sign     = 1.0  # reset direction for next block search
         if self._block_idx < len(self._block_queue):
             self.get_logger().info(
                 f'Pair {self._block_idx + 1}/{len(self._block_queue)}: '
@@ -389,6 +402,7 @@ class Task5Node(Node):
             self._transition(State.DONE)
 
     def _average_poses(self, poses: list) -> PoseStamped:
+        """Average multiple PoseStamped messages (position mean + quaternion mean)."""
         positions = np.array([[p.pose.position.x, p.pose.position.y, p.pose.position.z]
                               for p in poses])
         quats = np.array([[p.pose.orientation.x, p.pose.orientation.y,
@@ -422,9 +436,10 @@ class Task5Node(Node):
         return time.time() - self.state_start
 
     def _transform_to_base(self, pose_cam: PoseStamped) -> Optional[PoseStamped]:
+        """Transform PoseStamped from camera_depth_optical_frame → base_link."""
         try:
             tf = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_color_optical_frame',
+                'base_link', 'camera_depth_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=1.0))
         except Exception as e:
             self.get_logger().error(f'TF lookup failed: {e}')
@@ -470,7 +485,7 @@ class Task5Node(Node):
         req.target_pose.position.x += GRASP_OFFSET_X
         req.target_pose.position.y += GRASP_OFFSET_Y
         req.target_pose.position.z  = GRASP_Z + GRASP_OFFSET_Z
-        req.use_orientation        = True
+        req.use_orientation        = False
         req.max_condition_number   = 500.0
         req.execute                = True
         req.duration               = duration
@@ -485,21 +500,12 @@ class Task5Node(Node):
     def _do_find(self, next_state: State):
         mc = self.mask_center
         if mc is None:
+            # Target not visible — spin only
             self._spin()
-            new_tilt = self._cmd_tilt + self._tilt_sweep_dir * TILT_SWEEP_SPEED
-            if new_tilt <= TILT_MIN:
-                new_tilt = TILT_MIN
-                self._tilt_sweep_dir = 1.0
-            elif new_tilt >= TILT_MAX:
-                new_tilt = TILT_MAX
-                self._tilt_sweep_dir = -1.0
-            self._set_pan_tilt(self._cmd_pan, new_tilt)
             return
         h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y
-        self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         self.get_logger().info(
-            f'[{self.state.name}] cx={mc.x:.0f}  h_err={h_err:+.0f}  v_err={v_err:+.0f} px',
+            f'[{self.state.name}] cx={mc.x:.0f}  h_err={h_err:+.0f} px',
             throttle_duration_sec=0.5)
         if abs(h_err) < HORIZONTAL_TOL:
             self._stop()
@@ -507,7 +513,7 @@ class Task5Node(Node):
         else:
             self._spin()
 
-    def _do_approach(self, find_state: State, tilt_state: State):
+    def _do_approach(self, find_state: State, next_state: State):
         mc   = self.mask_center
         dist = self.object_distance
         if mc is None:
@@ -516,8 +522,6 @@ class Task5Node(Node):
             self._transition(find_state)
             return
         h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y
-        self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
         if abs(h_err) > RECENTER_TOL:
             self._stop()
             self.get_logger().warn(f'Heading drift ({h_err:+.0f} px) – re-centring')
@@ -525,43 +529,29 @@ class Task5Node(Node):
             return
         if dist is not None:
             self.get_logger().info(
-                f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f}  v_err={v_err:+.0f} px',
+                f'[{self.state.name}] dist={dist:.3f} m  h_err={h_err:+.0f} px',
                 throttle_duration_sec=0.5)
             if dist <= APPROACH_DIST:
                 self._stop()
-                self._transition(tilt_state)
+                self._transition(next_state)
                 return
         self._drive(h_err)
 
-    def _do_tilt(self, find_state: State, next_state: State):
-        mc = self.mask_center
-        if mc is None:
-            self.get_logger().warn('Object lost during tilt – re-searching')
-            self._transition(find_state)
-            return
-        h_err = mc.x - CENTER_X
-        v_err = mc.y - CENTER_Y
-        self.get_logger().info(
-            f'[{self.state.name}] h_err={h_err:+.0f}  v_err={v_err:+.0f}  '
-            f'tilt={self._cmd_tilt:.3f} rad',
-            throttle_duration_sec=0.3)
-        if abs(h_err) > RECENTER_TOL:
-            self.get_logger().warn(f'Horizontal drift ({h_err:+.0f} px) – re-searching')
-            self._transition(find_state)
-            return
-        if abs(v_err) < VERTICAL_TOL:
-            self.pose_timestamp = None
-            self._transition(next_state)
-        else:
-            self._set_pan_tilt(self._cmd_pan, self._cmd_tilt - v_err * TILT_GAIN)
-
     def _do_wait_pose(self, next_state: State):
+        """Wait for robot to settle, then collect and average pose samples.
+
+        Phase 1 (0 → SETTLE_TIME): let vibrations die down after stopping.
+        Phase 2 (SETTLE_TIME → SETTLE_TIME+POSE_WAIT_TIMEOUT): collect
+          NUM_POSE_SAMPLES fresh poses from simple_pose_fit and average them.
+        """
         elapsed = self._elapsed()
+
         if elapsed < SETTLE_TIME:
             self.get_logger().info(
                 f'[{self.state.name}] Settling … ({elapsed:.1f} / {SETTLE_TIME:.0f} s)',
                 throttle_duration_sec=0.5)
             return
+
         if self.pose_timestamp is not None and \
                 self.pose_timestamp >= self.state_start + SETTLE_TIME:
             if len(self._pose_samples) == 0 or \
@@ -570,12 +560,14 @@ class Task5Node(Node):
                 self.get_logger().info(
                     f'[{self.state.name}] Pose sample '
                     f'{len(self._pose_samples)}/{NUM_POSE_SAMPLES}')
+
         if len(self._pose_samples) >= NUM_POSE_SAMPLES:
             self.object_pose = self._average_poses([s[1] for s in self._pose_samples])
             self._pose_samples.clear()
             self.get_logger().info(f'[{self.state.name}] Averaged pose computed')
             self._transition(next_state)
             return
+
         total_timeout = SETTLE_TIME + POSE_WAIT_TIMEOUT
         if elapsed > total_timeout:
             if len(self._pose_samples) > 0:
@@ -586,7 +578,9 @@ class Task5Node(Node):
                 self._pose_samples.clear()
                 self._transition(next_state)
             else:
-                self.get_logger().error('Timed out waiting for /object_pose.')
+                self.get_logger().error(
+                    'Timed out waiting for /object_pose. '
+                    'Is simple_pose_fit.py running with the correct color?')
                 self._transition(State.ERROR)
         else:
             self.get_logger().info(
@@ -648,6 +642,8 @@ class Task5Node(Node):
                     setattr(self, retry_count_attr, retries)
                     if retries < max_retries:
                         self.get_logger().warn(f'Retrying ({retries}/{max_retries}) …')
+                        if mode == 'pick':
+                            self._open_gripper()
                         self.pose_timestamp = None
                         self._transition(retry_state)
                         return
@@ -664,8 +660,7 @@ class Task5Node(Node):
         # ── WAIT_SPEECH ──────────────────────────────────────────────────────
         if self.state == State.WAIT_SPEECH:
             if elapsed > SPEECH_TIMEOUT:
-                self.get_logger().error(
-                    f'Speech timeout — no valid pairs received.')
+                self.get_logger().error('Speech timeout — no valid pairs received.')
                 if self._speech_proc is not None:
                     self._speech_proc.terminate()
                     self._speech_proc = None
@@ -686,12 +681,7 @@ class Task5Node(Node):
         # ── APPROACH_BLOCK ────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BLOCK:
             self._do_approach(find_state=State.FIND_BLOCK,
-                              tilt_state=State.TILT_BLOCK)
-
-        # ── TILT_BLOCK ────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BLOCK:
-            self._do_tilt(find_state=State.FIND_BLOCK,
-                          next_state=State.WAIT_BLOCK_POSE)
+                              next_state=State.WAIT_BLOCK_POSE)
 
         # ── WAIT_BLOCK_POSE ───────────────────────────────────────────────────
         elif self.state == State.WAIT_BLOCK_POSE:
@@ -707,9 +697,9 @@ class Task5Node(Node):
                 max_retries=MAX_GRASP_RETRIES,
                 retry_count_attr='_grasp_retries',
             )
-            # On grasp success: switch vision to this pair's specific bin color.
             if self.state == State.FIND_BIN:
                 self._grasp_retries = 0
+                self._spin_sign = -1.0  # spin opposite to find bin efficiently
                 self._set_pan_tilt(0.0, 0.0)
                 self._switch_vision(self._current_bin_color)
 
@@ -723,12 +713,7 @@ class Task5Node(Node):
         # ── APPROACH_BIN ──────────────────────────────────────────────────────
         elif self.state == State.APPROACH_BIN:
             self._do_approach(find_state=State.FIND_BIN,
-                              tilt_state=State.TILT_BIN)
-
-        # ── TILT_BIN ──────────────────────────────────────────────────────────
-        elif self.state == State.TILT_BIN:
-            self._do_tilt(find_state=State.FIND_BIN,
-                          next_state=State.WAIT_BIN_POSE)
+                              next_state=State.WAIT_BIN_POSE)
 
         # ── WAIT_BIN_POSE ─────────────────────────────────────────────────────
         elif self.state == State.WAIT_BIN_POSE:
