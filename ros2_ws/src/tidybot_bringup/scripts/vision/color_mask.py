@@ -46,38 +46,35 @@ def color_mask(color_img, color_name='r'):
     mask = None
 
     if color == 'red':
-        # Red wraps around 0 and 180
-        lower1 = np.array([0, 70, 50])
+        # Red wraps around 0 and 180; V≥100 rejects dark shadow reds
+        lower1 = np.array([0, 70, 100])
         upper1 = np.array([10, 255, 255])
-        lower2 = np.array([170, 70, 50])
+        lower2 = np.array([170, 70, 100])
         upper2 = np.array([180, 255, 255])
         mask = cv2.bitwise_or(
             cv2.inRange(hsv_img, lower1, upper1),
             cv2.inRange(hsv_img, lower2, upper2)
         )
-    elif color == 'green': # NOTE: didn't work well in yellow-lit environment, may need tuning
-        lower = np.array([40, 70, 50])
+    elif color == 'green':
+        lower = np.array([40, 70, 100])
         upper = np.array([80, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'blue':
-        # lower = np.array([103, 63, 53]) # HACK: for yellow env light.
-        lower = np.array([90, 50, 40])
+        lower = np.array([90, 50, 100])
         upper = np.array([130, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'yellow':
-        lower = np.array([15, 40, 100])
+        lower = np.array([15, 40, 120])
         upper = np.array([35, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'orange':
-        # H=11–25: sits just above red (0–10), well below yellow (15–35 overlaps slightly
-        # but orange has much higher saturation so the S≥100 floor separates them).
-        lower = np.array([11, 100, 50])
+        # H=11–25: sits just above red (0–10), well below yellow
+        lower = np.array([11, 100, 100])
         upper = np.array([25, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
     elif color == 'purple':
-        # H=131–160: sits just above blue (90–130).
-        # Covers violet through magenta-purple; S≥50 rejects grey/lavender walls.
-        lower = np.array([131, 50, 40])
+        # H=131–160: sits just above blue (90–130)
+        lower = np.array([131, 50, 100])
         upper = np.array([160, 255, 255])
         mask = cv2.inRange(hsv_img, lower, upper)
 
